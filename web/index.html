@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>better-debug 增益面板</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: var(--dsw-alias-bg-base, #0f1115);
+    --card: var(--dsw-alias-bg-elevated, #171a20);
+    --card-border: var(--dsw-alias-border-subtle, #262b33);
+    --fg: var(--dsw-alias-text-primary, #e7ebf0);
+    --fg-dim: var(--dsw-alias-text-secondary, #9aa4b2);
+    --fg-faint: #6b7480;
+    --accent: #4f8cff;
+    --good: #35c46a;
+    --warn: #ffb020;
+    --bad: #ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
+  body {
+    font: 13px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    padding: 20px 22px 40px;
+  }
+  h1 { font-size: 19px; font-weight: 650; margin: 0 0 4px; letter-spacing: .2px; }
+  .sub { color: var(--fg-dim); font-size: 12px; margin: 0 0 18px; }
+  .sub code { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-border); border-radius: 10px;
+    padding: 16px 18px 14px; min-height: 122px; display: flex; flex-direction: column;
+  }
+  .card .k { color: var(--fg-dim); font-size: 12px; margin-bottom: 10px; }
+  .card .v { font-size: 30px; font-weight: 650; line-height: 1.1; letter-spacing: -.5px; }
+  .card .v.good { color: var(--good); }
+  .card .v.accent { color: var(--accent); }
+  .card .v.muted { color: var(--fg-faint); }
+  .card .v small { font-size: 15px; font-weight: 500; color: var(--fg-dim); margin-left: 3px; }
+  .card .n { color: var(--fg-faint); font-size: 11.5px; margin-top: auto; padding-top: 10px; line-height: 1.5; }
+
+  .section { margin-top: 26px; }
+  .section > h2 {
+    font-size: 13px; font-weight: 600; color: var(--fg-dim);
+    margin: 0 0 10px; letter-spacing: .3px;
+  }
+
+  .bars { display: flex; flex-direction: column; gap: 7px; }
+  .bar { display: grid; grid-template-columns: 152px 1fr 64px; align-items: center; gap: 10px; }
+  .bar .lab { font-size: 12px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar .track { height: 8px; border-radius: 4px; background: #232833; overflow: hidden; }
+  .bar .fill { height: 100%; border-radius: 4px; background: var(--accent); transition: width .25s ease; }
+  .bar .fill.a { background: #ff8a5b; }
+  .bar .fill.b { background: #ffb020; }
+  .bar .fill.c { background: #4f8cff; }
+  .bar .num { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); text-align: right; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--card-border); }
+  th { color: var(--fg-faint); font-weight: 500; font-size: 11.5px; }
+  td { color: var(--fg-dim); }
+  td.mono, th.mono { font-family: var(--mono); font-size: 11px; }
+  tr:last-child td { border-bottom: 0; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-family: var(--mono); font-size: 10.5px; }
+  .tag.A { background: rgba(255,138,91,.16); color: #ff9d78; }
+  .tag.B { background: rgba(255,176,32,.16); color: #ffc14d; }
+  .tag.C { background: rgba(79,140,255,.16); color: #7ba7ff; }
+  .tag.verify { background: rgba(53,196,106,.15); color: #57d189; }
+  .tag.search { background: rgba(53,196,106,.15); color: #57d189; }
+  .tag.edit { background: rgba(255,107,107,.14); color: #ff8d8d; }
+  .tag.other { background: rgba(154,164,178,.14); color: var(--fg-dim); }
+
+  .foot { margin-top: 22px; color: var(--fg-faint); font-size: 11.5px; line-height: 1.65; }
+  .foot p { margin: 0 0 6px; }
+  .foot b { color: var(--fg-dim); font-weight: 600; }
+  .empty { color: var(--fg-faint); font-size: 12px; padding: 14px 2px; }
+  .err {
+    border: 1px solid rgba(255,107,107,.4); background: rgba(255,107,107,.08);
+    color: #ffd0d0; padding: 10px 12px; border-radius: 8px; font-size: 12px; margin-bottom: 14px;
+  }
+  .err code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+  <h1>better-debug 增益面板</h1>
+  <p class="sub">数据源：<code id="logfile">…</code> · 只读，不改插件行为</p>
+
+  <div id="error" class="err" hidden></div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="k">闸门触发次数</div>
+      <div class="v accent" id="injects">—</div>
+      <div class="n" id="injects-note">—</div>
+    </div>
+    <div class="card">
+      <div class="k">覆盖会话</div>
+      <div class="v" id="sessions">—</div>
+      <div class="n" id="sessions-note">—</div>
+    </div>
+    <div class="card">
+      <div class="k">注入后模型换动作</div>
+      <div class="v good" id="changed">—</div>
+      <div class="n" id="changed-note">—</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>三条信号各响了多久</h2>
+    <div class="bars" id="signal-bars"></div>
+  </div>
+
+  <div class="section">
+    <h2>注入后第一个动作</h2>
+    <div class="bars" id="outcome-bars"></div>
+  </div>
+
+  <div class="section">
+    <h2>最近触发</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th><th>会话</th><th class="mono">轮/步</th>
+          <th>信号</th><th class="mono">最热文件</th><th class="mono">最热报错</th><th>已搜</th>
+        </tr>
+      </thead>
+      <tbody id="recent"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="foot">
+    <p><b>每个数字都是数出来的。</b>触发次数、覆盖会话、信号分布，逐行来自日志里的 <code>inject</code> 行；「换动作」来自每条注入之后的第一条 <code>tool/call</code>；「单次注入开销」来自 <code>chars=</code> 字符数折算。</p>
+    <p><b>不统计的东西：</b>它不估算「省掉了多少 token」——那需要先假设模型本来会失败，属于编数。它也不证明「本来会失败」的假设。想知道真实收益，一次只改一个变量做对照。</p>
+  </div>
+
+<script>
+(function () {
+  'use strict'
+  var $ = function (id) { return document.getElementById(id) }
+
+  function fmt(n) {
+    if (n === null || n === undefined || Number.isNaN(n)) return '—'
+    var v = Number(n)
+    if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(2) + 'B'
+    if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(2) + 'M'
+    if (Math.abs(v) >= 1e4) return (v / 1e3).toFixed(1) + 'K'
+    return String(Math.round(v))
+  }
+
+  function pct(n) {
+    if (n === null || n === undefined) return '—'
+    return (n * 100).toFixed(0) + '%'
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+  }
+
+  function shortSession(id) {
+    if (!id) return '—'
+    return id.length > 16 ? id.slice(0, 12) + '…' : id
+  }
+
+  function bar(label, value, total, cls) {
+    var share = total > 0 ? Math.max(2, Math.round((value / total) * 100)) : 0
+    return '<div class="bar"><span class="lab">' + esc(label) + '</span>' +
+      '<div class="track"><div class="fill ' + (cls || '') + '" style="width:' + share + '%"></div></div>' +
+      '<span class="num">' + esc(String(value)) + '</span></div>'
+  }
+
+  function render(d) {
+    var inj = d.injects || {}
+    var out = d.outcomes || {}
+    var lg = d.log || {}
+
+    $('logfile').textContent = lg.file || '(未配置 logFile)'
+
+    $('injects').textContent = fmt(inj.total || 0)
+    var tags = Object.keys(inj.byTag || {})
+      .sort(function (a, b) { return inj.byTag[b] - inj.byTag[a] })
+      .map(function (k) { return k + '×' + inj.byTag[k] })
+      .join(' · ')
+    $('injects-note').textContent = tags || '还没有触发过'
+
+    $('sessions').textContent = fmt(inj.sessions || 0)
+    $('sessions-note').textContent =
+      (inj.turns || 0) + ' 个轮次 · 注入文本累计 ' + fmt(inj.chars || 0) + ' 字符 · 约 ' + fmt(inj.estTokens || 0) + ' tok'
+
+    var reported = out.reported || 0
+    if (reported === 0) {
+      $('changed').textContent = '—'
+      $('changed').className = 'v muted'
+      $('changed-note').textContent = inj.total > 0
+        ? '已注入 ' + inj.total + ' 次，但还没有观察到后续动作（需要下一次工具调用）'
+        : '还没有注入，无法统计'
+    } else {
+      $('changed').textContent = pct(out.changedRate)
+      $('changed').className = 'v good'
+      $('changed-note').textContent =
+        (out.changed || 0) + '/' + reported + ' 次转去验证或搜索' +
+        (out.silent > 0 ? ' · ' + out.silent + ' 次未观察到后续' : '') +
+        (out.medianSteps !== null && out.medianSteps !== undefined
+          ? ' · 中位 ' + out.medianSteps + ' 步内出手' : '')
+    }
+
+    var total = Math.max(1, (inj.bySignal && (inj.bySignal.A + inj.bySignal.B + inj.bySignal.C)) || 0)
+    $('signal-bars').innerHTML =
+      bar('A 同一文件反复改', (inj.bySignal && inj.bySignal.A) || 0, total, 'a') +
+      bar('B 同一报错反复', (inj.bySignal && inj.bySignal.B) || 0, total, 'b') +
+      bar('C 改完不验证', (inj.bySignal && inj.bySignal.C) || 0, total, 'c')
+
+    var bc = out.byClass || {}
+    var outTotal = Math.max(1, reported)
+    $('outcome-bars').innerHTML = reported === 0
+      ? '<div class="empty">还没有可统计的后续动作。</div>'
+      : bar('verify 跑验证', bc.verify || 0, outTotal, 'c') +
+        bar('search 查资料', bc.search || 0, outTotal, 'c') +
+        bar('edit 继续改', bc.edit || 0, outTotal, 'a') +
+        bar('other 其它', bc.other || 0, outTotal, 'b')
+
+    var rows = d.recent || []
+    if (rows.length === 0) {
+      $('recent').innerHTML = '<tr><td colspan="7" class="empty">暂无记录</td></tr>'
+    } else {
+      $('recent').innerHTML = rows.slice().reverse().map(function (r) {
+        var at = r.at ? new Date(r.at).toLocaleString() : '—'
+        var tag = String(r.tag || '?').split('+').map(function (k) {
+          return '<span class="tag ' + esc(k) + '">' + esc(k) + '</span>'
+        }).join(' ')
+        return '<tr>' +
+          '<td class="mono">' + esc(at) + '</td>' +
+          '<td class="mono" title="' + esc(r.session) + '">' + esc(shortSession(r.session)) + '</td>' +
+          '<td class="mono">' + esc((r.turn || 0) + '/' + (r.step || 0)) + '</td>' +
+          '<td>' + tag + '</td>' +
+          '<td class="mono">' + esc(r.worstEdits > 0 ? '×' + r.worstEdits : '—') + '</td>' +
+          '<td class="mono">' + esc(r.worstErrors > 0 ? '×' + r.worstErrors : '—') + '</td>' +
+          '<td>' + (r.searched ? '是' : '否') + '</td>' +
+          '</tr>'
+      }).join('')
+    }
+
+    if (lg.disabled) {
+      $('error').hidden = false
+      $('error').textContent = '日志里有 ' + lg.disabled + ' 条 disabled by config —— 插件当前被关闭。'
+    } else if (lg.skillFailed) {
+      $('error').hidden = false
+      $('error').textContent = '自带技能注册失败 ' + lg.skillFailed + ' 次，闸门本身不受影响。'
+    }
+  }
+
+  function fail(message) {
+    var box = $('error')
+    box.hidden = false
+    box.innerHTML = '读不到数据：<code>' + esc(message) + '</code><br>检查插件的 <code>logFile</code> 是否指向真实日志，以及 <code>inject: [skills]</code> 是否已加载。'
+  }
+
+  function load() {
+    fetch('/better-debug/api', { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+        return r.json()
+      })
+      .then(function (d) {
+        if (d.ok === false) throw new Error(d.error || 'unknown')
+        render(d)
+      })
+      .catch(function (e) { fail(e && e.message ? e.message : String(e)) })
+  }
+
+  load()
+  setInterval(load, 5000)
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) load()
+  })
+})()
+</script>
+</body>
+</html>

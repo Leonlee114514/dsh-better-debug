@@ -68,6 +68,53 @@ A/B 触发时会顺带把 C 标成已触发：A/B 已经说明了局面，再补
 
 宿主若没有 `skills` 服务（老版本 DSH），注册会被跳过并记一行日志，**闸门本身照常工作**。
 
+## 增益面板
+
+日志只有一种人爱读，就是写它的人。面板把它变成一眼能看的东西：**设置页 → better-debug**，
+一个 iframe 视图，5 秒自刷新，只读，不改插件行为。
+
+三张主卡：
+
+| 卡 | 数据来源 | 能说明什么 |
+| --- | --- | --- |
+| 闸门触发次数 | 每条 `inject` 行 | 提醒一共说了几次，按 `A/B/C` 与组合标签分组 |
+| 覆盖会话 | `inject` 行的 `session=` 去重 | 影响了多少个会话、多少个轮次、注入文本总共多少字符 |
+| 注入后模型换动作 | `outcome` 行的 `class=` | **唯一的客观效果指标**：提醒之后那条 `tool/call` 是转去验证/搜索，还是继续改 |
+
+它同时暴露一件事：**没有 `outcome` 行时，「换动作」是空的**。面板不会替你编一个百分比。
+
+### 为面板新增的埋点
+
+注入之后，插件等**第一条**后续 `tool/call`，写一行：
+
+```
+outcome session=… turn=39 after=C first=ops_bash class=verify steps=1
+```
+
+- `after` 是触发它的那次注入的信号标签；
+- `first` 是模型真正做的下一件事，`class` 归为 `verify` / `search` / `edit` / `other`；
+- `steps` 是隔了几步才出手（`0` 表示下一步就换）。
+
+只收第一条：晚到的验证不能把早先的原地打转洗白。
+
+`inject` 行同时补了 `chars=`（注入正文的字符数），面板上的「单次注入开销」由它算出来。
+老日志没有这个字段，解析器按信号组合回填（`A=254` / `B=268` / `C=256` / `A+B=307` 字符）。
+
+### 面板的三条自我约束
+
+1. **每个数字都是数出来的。** 触发次数、覆盖会话、信号分布逐行来自日志；注入开销来自 `chars=`。
+2. **「换动作」只算有 `outcome` 的那几次。** 分母是「已被观察到的注入」，不是全部注入。
+3. **不估算「省掉了多少 token」。** 那个数字要先假设「模型本来会失败、会多绕一圈」，
+   属于编数。插件的职责是把可观测的事记下来，把判断留给看的人。
+
+### 关掉面板
+
+`config: { panel: false }`。路由不挂，`/better-debug` 返回 404，闸门不受影响。
+
+路由用 `ctx.inject(['webServer'], …)` **动态注入**，没有加进 `export const inject` ——
+后者是结构性变更，会让热重载失效，也会让没有 `webServer` 的宿主连闸门都装不上。
+宿主缺 `webServer` 时日志写一行 `panel unavailable: …`，其余功能照常。
+
 ## 安装
 
 ```bash
@@ -91,6 +138,9 @@ cd ~/.dsh/profiles/desktop
 # 4. 重启 DSH。inject 里多了 skills 属于结构性变更，HMR 未必能生效。
 ```
 
+面板不需要额外的 inject：它用动态注入挂路由，`export const inject` 一直只声明 `skills`。
+想看面板就打开 **设置 → better-debug**，或直接访问 `http://<web-origin>/better-debug`。
+
 ## 配置
 
 ```yaml
@@ -103,6 +153,7 @@ cd ~/.dsh/profiles/desktop
     repeatErrorThreshold: 2     # B：同一类报错几次算打转
     noVerifySteps: 2            # C：改完几步没验证算打转
     logFile: ""                 # 绝对路径；空 = 不落盘（ctx.logger 只进 stdout）
+    panel: true                 # 挂 /better-debug 只读面板；false = 不挂路由
 ```
 
 调紧（更容易触发）→ 数字调小；放松 → 调大。`enabled: false` 时连 listener 都不注册。
@@ -114,26 +165,36 @@ cd ~/.dsh/profiles/desktop
    （`ctx.logger` 只进 Electron stdout，事后 grep 不到）。没有 `apply` 行就是没挂上。
 3. 正常干活，日志出现这样一行即为命中：
    ```
-   inject session=… turn=32 step=98 signals=A files=1 worstEdits=3 worstErrors=0 searched=false
+   inject session=… turn=32 step=98 signals=A chars=254 files=1 worstEdits=3 worstErrors=0 searched=false
    ```
    `signals` 是命中的信号（`A`/`B`/`C`，多条用 `+`）；`files` 是本 turn 碰过的**不同文件数**、
    `worstEdits` 是其中**最惨那个被改了几次**——判 A 用的是后者。两个数字混着看才不误导：
    `files=1 worstEdits=3` 才是「盯着一个文件改三遍」。
+   紧接着还会有 `outcome` 行（见「增益面板 / 为面板新增的埋点」）。
 4. 自证指标：注入后**下一个** `tool/call` 的类别有没有变。
    `edit → edit` 说明它被无视了；`edit → lsp_diagnostics / web_search / 读新文件`
    说明提醒有效。持续低于 30% 就该改文案或阈值，而不是加更多信号。
+   **这一项现在由插件自己记**（`outcome` 行），不用手工比对；面板把它算成「换动作率」。
 
 ## 本地验证
 
 ```bash
-node --check lib/index.js
-node test/sim.mjs
+node --check lib/index.js && node --check lib/panel.js && node --check client.js
+node test/sim.mjs      # 15 个用例：闸门行为
+node test/panel.mjs    # 17 个用例：日志解析、聚合、注入开销、埋点落盘
+npm run verify         # 上面全部
 ```
 
 `test/sim.mjs` 用假 ctx 复刻 agent-loop 的调用顺序（`emitPlain` / `emitWaterfall` /
 `emitSerial`），覆盖 **15 个用例**：A/B/C 各一条正例与反例、幂等、D 段静音、子会话跳过、
 阈值可调、`enabled:false`、自带技能注册（含正文可取与已去私有化）、宿主无 `skills` 服务时不抛、
 导出形状。**不依赖 DSH 运行时**，改动后先跑它。
+
+`test/panel.mjs` 覆盖 **17 个用例**：带引号与转义的字段切分、三种行型解析、缺 `chars=` 的
+回退、分布与会话去重、阈值取最后一条 `apply`、`estimate` 只剩实测的注入开销、
+空日志与坏行不抛，
+以及一条端到端——真跑 `apply()` 走完一个 turn，读回日志断言 `inject` 与 `outcome`
+两行都写了、且聚合把它算成「换了动作」。同样不依赖 DSH。
 
 ## 已知边界
 
@@ -143,6 +204,10 @@ node test/sim.mjs
   宁可漏判也不误判成「已验证」。
 - 只在**主会话**生效。多 agent 场景下每个 subagent 各自打转不会被拦——但它们的产物最终
   汇到 lead，lead 这边的计数仍然有效。
+- 面板是**只读的日志视图**，不是监控：它不写任何数据，也不改变闸门判定。`logFile` 为空时
+  面板只剩「未配置 logFile」，一切统计为 0。
+- 面板的 `changedRate` 分母是「已被观察到的注入」。注入后 turn 直接结束（没有后续
+  `tool/call`）不计入，因此样本少时这个百分比波动很大——看量级，别当 KPI。
 
 ## License
 

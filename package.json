@@ -1,18 +1,22 @@
 {
   "name": "dsh-better-debug",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "卡住闸门的代码化：同一文件反复改 / 同一报错反复吃 / 改完不验证，命中就在下一步注入一次提醒，逼出一条几秒能跑的反馈回路。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/",
     "assets/",
+    "web/",
+    "client.js",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
     "LICENSE"
   ],
   "keywords": [
@@ -33,6 +37,12 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ]
+    },
     "engines": {
       "dsh": ">=0.2.1-rc.5"
     }
@@ -41,8 +51,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check lib/index.js && node --check test/sim.mjs",
-    "test": "node test/sim.mjs",
-    "verify": "npm run check && node test/sim.mjs"
+    "check": "node --check lib/index.js && node --check lib/panel.js && node --check client.js && node --check test/sim.mjs && node --check test/panel.mjs",
+    "test": "node test/sim.mjs && node test/panel.mjs",
+    "verify": "npm run check && npm test"
   }
 }
