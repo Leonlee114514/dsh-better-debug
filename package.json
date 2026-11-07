@@ -1,0 +1,48 @@
+{
+  "name": "dsh-better-debug",
+  "version": "0.1.0",
+  "description": "卡住闸门的代码化：同一文件反复改 / 同一报错反复吃 / 改完不验证，命中就在下一步注入一次提醒，逼出一条几秒能跑的反馈回路。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "assets/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "debugging",
+    "agent-hygiene",
+    "pre-step"
+  ],
+  "license": "MIT",
+  "author": "Leonlee114514",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Leonlee114514/dsh-better-debug.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": ">=0.2.1-rc.5"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check test/sim.mjs",
+    "test": "node test/sim.mjs",
+    "verify": "npm run check && node test/sim.mjs"
+  }
+}

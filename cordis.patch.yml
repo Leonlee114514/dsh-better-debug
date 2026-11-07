@@ -1,0 +1,27 @@
+# dsh-better-debug — bundle manifest entry.
+#
+# Mounts the gate with defaults on. Override any key under the same id in your
+# own profile's cordis.patch.yml:
+#
+#   enabled: false              → installed but inert (no listener registered)
+#   repeatEditThreshold: 4      → loosen "same file re-edited" from 3 to 4
+#   repeatErrorThreshold: 3     → loosen "same error repeated" from 2 to 3
+#   noVerifySteps: 3            → loosen "edited N steps ago, still no check"
+#
+# If you already registered this plugin by hand (manual link + your own
+# `- id: better-debug` row), remove that row first: two rows with the same
+# loader entry id make cordis reject the duplicate.
+#
+# Do NOT rename this id to differ from your profile row. Two *different* ids
+# pointing at the same package name mount the plugin twice — two listener sets,
+# every reminder injected twice, every log line doubled.
+- insert:
+    - id: better-debug
+      name: dsh-better-debug
+      inject: [skills]
+      config:
+        enabled: true
+        repeatEditThreshold: 3
+        repeatErrorThreshold: 2
+        noVerifySteps: 2
+        logFile: ""
