@@ -26,7 +26,7 @@ function check(label, pass, detail) {
 // ── 2. 三种行型各自解析成结构化记录
 {
   const inject = parseLine(
-    '2026-11-07T02:38:23.965Z inject session=s-1 turn=39 step=19 signals=C chars=256 files=2 worstEdits=1 worstErrors=0 searched=true'
+    '2026-11-07T02:38:23.965Z inject session=s-1 turn=39 step=19 signals=C chars=256 files=2 worstEdits=1 worstStreak=1 worstErrors=0 searched=true'
   )
   const outcome = parseLine(
     '2026-11-07T02:38:40.001Z outcome session=s-1 turn=39 after=C first=ops_bash class=verify steps=1'
@@ -37,7 +37,7 @@ function check(label, pass, detail) {
   check(
     'parseLine 认 inject',
     inject.kind === 'inject' && inject.signals.length === 1 && inject.signals[0] === 'C' &&
-      inject.chars === 256 && inject.worstEdits === 1 && inject.searched === true,
+      inject.chars === 256 && inject.worstEdits === 1 && inject.worstStreak === 1 && inject.searched === true,
     `${inject.kind} ${inject.signals} ${inject.chars}`
   )
   check(
@@ -197,6 +197,43 @@ function check(label, pass, detail) {
   try {
     rmSync(logFile, { force: true })
   } catch {}
+}
+
+// ── 18. A 的判据字段必须在「日志 → parseLine → aggregate.recent → 面板」全链路活下来
+{
+  const text = [
+    '2026-11-11T00:00:00.000Z inject session=s-1 turn=1 step=4 signals=A chars=254 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false',
+    '2026-11-11T00:00:01.000Z inject session=s-2 turn=1 step=4 signals=A chars=254 files=1 worstEdits=3 worstStreak=1 worstErrors=0 searched=false'
+  ].join('\n')
+  const records = parseLog(text)
+  const a = aggregate(records, { logFile: '', exists: true, bytes: text.length })
+  const blind = a.recent.find((r) => String(r.at).includes('00:00:00'))
+  const checked = a.recent.find((r) => String(r.at).includes('00:00:01'))
+  check(
+    '面板保留 A 的判据 worstStreak（累计相同、连续盲改不同）',
+    records[0].worstStreak === 3 && records[1].worstStreak === 1 &&
+      blind.worstStreak === 3 && checked.worstStreak === 1 &&
+      blind.worstEdits === checked.worstEdits,
+    `worstEdits=${blind.worstEdits} streak=${blind.worstStreak}/${checked.worstStreak}`
+  )
+}
+
+// ── 19. done-state 的 suppress 行要能被面板读出来（醒着但故意不出声 ≠ 没挂上）
+{
+  const text = [
+    '2026-11-11T00:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 panel=true',
+    '2026-11-11T00:00:01.000Z suppress session=s-1 turn=1 step=7 reason=done',
+    '2026-11-11T00:00:02.000Z suppress session=s-2 turn=1 step=8 reason=done'
+  ].join('\n')
+  const records = parseLog(text)
+  const sup = records.filter((r) => r.kind === 'suppress')
+  const a = aggregate(records, { logFile: 'C:/x.log', exists: true, bytes: text.length })
+  check(
+    'done-state suppress 行可解析与计数，且不算触发',
+    sup.length === 2 && sup[0].reason === 'done' && sup[0].session === 's-1' &&
+      a.log.suppressed === 2 && a.injects.total === 0,
+    `suppressed=${a.log.suppressed} injects=${a.injects.total}`
+  )
 }
 
 const failed = results.filter((r) => !r.pass)

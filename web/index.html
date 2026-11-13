@@ -125,7 +125,7 @@
       <thead>
         <tr>
           <th>时间</th><th>会话</th><th class="mono">轮/步</th>
-          <th>信号</th><th class="mono">最热文件</th><th class="mono">最热报错</th><th>已搜</th>
+          <th>信号</th><th class="mono">最热文件（累计/连续盲改）</th><th class="mono">最热报错</th><th>已搜</th>
         </tr>
       </thead>
       <tbody id="recent"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
@@ -133,7 +133,7 @@
   </div>
 
   <div class="foot">
-    <p><b>每个数字都是数出来的。</b>触发次数、覆盖会话、信号分布，逐行来自日志里的 <code>inject</code> 行；「换动作」来自每条注入之后的第一条 <code>tool/call</code>；「单次注入开销」来自 <code>chars=</code> 字符数折算。</p>
+    <p><b>每个数字都是数出来的。</b>触发次数、覆盖会话、信号分布，逐行来自日志里的 <code>inject</code> 行；「换动作」来自每条注入之后的第一条 <code>tool/call</code>；「单次注入开销」来自 <code>chars=</code> 字符数折算。<span id="suppressed-note"></span></p>
     <p><b>不统计的东西：</b>它不估算「省掉了多少 token」——那需要先假设模型本来会失败，属于编数。它也不证明「本来会失败」的假设。想知道真实收益，一次只改一个变量做对照。</p>
   </div>
 
@@ -180,6 +180,9 @@
     var lg = d.log || {}
 
     $('logfile').textContent = lg.file || '(未配置 logFile)'
+    $('suppressed-note').textContent = lg.suppressed > 0
+      ? ' 另有 ' + lg.suppressed + ' 次「交付态主动静默」（suppress reason=done）：闸门醒着、判过了、故意不注入，不计入触发。'
+      : ''
 
     $('injects').textContent = fmt(inj.total || 0)
     var tags = Object.keys(inj.byTag || {})
@@ -238,7 +241,9 @@
           '<td class="mono" title="' + esc(r.session) + '">' + esc(shortSession(r.session)) + '</td>' +
           '<td class="mono">' + esc((r.turn || 0) + '/' + (r.step || 0)) + '</td>' +
           '<td>' + tag + '</td>' +
-          '<td class="mono">' + esc(r.worstEdits > 0 ? '×' + r.worstEdits : '—') + '</td>' +
+          '<td class="mono" title="累计 ' + esc(r.worstEdits || 0) + ' 次 · 连续盲改 ' + esc(r.worstStreak || 0) + ' 次">' +
+            esc(r.worstEdits > 0 ? '×' + r.worstEdits : '—') +
+            (r.worstStreak > 0 ? ' <span class="tag a">盲×' + esc(r.worstStreak) + '</span>' : '') + '</td>' +
           '<td class="mono">' + esc(r.worstErrors > 0 ? '×' + r.worstErrors : '—') + '</td>' +
           '<td>' + (r.searched ? '是' : '否') + '</td>' +
           '</tr>'

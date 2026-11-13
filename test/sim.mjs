@@ -324,6 +324,67 @@ check(
   `${name} / ${JSON.stringify(inject)}`
 )
 
+// ── 15. 收敛不算卡住：每两次编辑之间夹一次测量，连续盲改计数被清零
+{
+  const ctx = makeCtx()
+  apply(ctx, {})
+  const agent = makeAgent(makeSession())
+  const P = 'C:/work/src/converge.js'
+  const steps = [
+    [(s) => edit(P)(s, ctx), (s) => call('v1', 'ops_bash')(s, ctx)],
+    [(s) => edit(P)(s, ctx), (s) => call('v2', 'ops_bash')(s, ctx)],
+    [(s) => edit(P)(s, ctx)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('A: 编辑间有测量（收敛）→ 不响', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 16. decayEditsOnVerify:false → 退回旧行为（收敛也会响）
+{
+  const ctx = makeCtx()
+  apply(ctx, { decayEditsOnVerify: false })
+  const agent = makeAgent(makeSession())
+  const P = 'C:/work/src/converge-old.js'
+  const steps = [
+    [(s) => edit(P)(s, ctx), (s) => call('v1', 'ops_bash')(s, ctx)],
+    [(s) => edit(P)(s, ctx), (s) => call('v2', 'ops_bash')(s, ctx)],
+    [(s) => edit(P)(s, ctx)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = injected.find((entry) => entry.texts.some((t) => t.includes('同一个文件')))
+  check('decayEditsOnVerify:false → 收敛仍响（可回滚）', hit !== void 0, hit ? `step=${hit.step}` : 'no injection')
+}
+
+// ── 17. done-state：present 之后改完不验证也不该再注入
+{
+  const ctx = makeCtx()
+  apply(ctx, {})
+  const agent = makeAgent(makeSession())
+  const P = 'C:/work/src/deliver.js'
+  const steps = [
+    [(s) => edit(P)(s, ctx), (s) => call('p1', 'present')(s, ctx)],
+    [], [], []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('done-state: present 后不注入', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 18. doneOnPresent:false → 退回旧行为（交付后仍会响）
+{
+  const ctx = makeCtx()
+  apply(ctx, { doneOnPresent: false })
+  const agent = makeAgent(makeSession())
+  const P = 'C:/work/src/deliver-old.js'
+  const steps = [
+    [(s) => edit(P)(s, ctx), (s) => call('p1', 'present')(s, ctx)],
+    [], [], []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('doneOnPresent:false → 交付后仍注入（可回滚）', injected.length > 0, `injections=${injected.length}`)
+}
+
 const failed = results.filter((r) => !r.pass)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 if (failed.length > 0) {

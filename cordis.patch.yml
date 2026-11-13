@@ -7,6 +7,8 @@
 #   repeatEditThreshold: 4      → loosen "same file re-edited" from 3 to 4
 #   repeatErrorThreshold: 3     → loosen "same error repeated" from 2 to 3
 #   noVerifySteps: 3            → loosen "edited N steps ago, still no check"
+#   decayEditsOnVerify: false   → 关闭「verify 后清零连续盲改计数」，退回旧 A 行为
+#   doneOnPresent: false        → 关闭交付态休眠，交付后仍注入
 #
 # If you already registered this plugin by hand (manual link + your own
 # `- id: better-debug` row), remove that row first: two rows with the same

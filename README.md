@@ -11,7 +11,7 @@
 
 | 信号 | 触发条件 | 默认阈值 | 为什么是它 |
 | --- | --- | --- | --- |
-| **A** 同一文件反复改 | `fs/write-intent` 按绝对路径计数 | 第 **3** 次 | 单点反复摩擦是最典型的「没建出回路就在猜」 |
+| **A** 同一文件**连续盲改** | `fs/write-intent` 按绝对路径计数；**一次 verify 到达即清零** | 第 **3** 次 | 单点反复摩擦且中间夹不进新事实，才是最典型的「没建回路就在猜」 |
 | **B** 同一报错反复吃 | `tool/result` 错误指纹去重计数，且本 turn 未搜过 | 第 **2** 次 | 同一个错两次说明第一次没读懂；且补了「该搜没搜」 |
 | **C** 改完不验证 | 最后一次写入后已过 N 步，这期间既没验证也没搜 | **2** 步 | 「改完就跑下一个」是最常见的漏验证 |
 
@@ -22,8 +22,12 @@
 `web_search` `research` `advanced_search` `multi_search` `platform_search`
 `domain_search` `cache_search` `video_search`
 
-**验证类工具**（A 与 C 解除）：
-`ops_bash` `lsp_diagnostics`。
+**验证类工具**（A 的连续盲改计数清零、C 解除）：
+`ops_bash` `lsp_diagnostics` `verify` `run_tests`。
+
+> 「清零」是有意的：词数 725→664→601→591 这种**每改一次就跑一次测量**的收敛，
+> 数字朝目标单调走、每步都有新信息，属于有回路的迭代，不是原地打转。
+> 旧版把累计编辑次数当 A 的判据，会在这类任务上误报（`decayEditsOnVerify: false` 可退回旧行为）。
 
 ## 不做的事
 
@@ -45,6 +49,26 @@
 才会再次开口。两个条件缺一不可——否则模型每多跑一步就被念一遍，turn 永远结束不了。
 
 A/B 触发时会顺带把 C 标成已触发：A/B 已经说明了局面，再补一句「改完没验证」只是换个说法。
+
+## 触发前置（v0.1.2）
+
+闸门只管「下一次尝试之前」，不管「交完货之后」。命中信号也先过三道前置：
+
+1. **done-state**：本 turn 出现过 `present`（交付物已挂出）且之后没有新的写入意图 → **不注入**。
+   写一行 `suppress … reason=done`。下一次 `fs/write-intent` 会把 done 复位，闸门重新武装。
+   关掉：`doneOnPresent: false`。
+2. **有进展的收敛**：见上表 A 的清零规则。关掉：`decayEditsOnVerify: false`。
+3. **任务类型**：写作 / 词数校准 / 版式收敛没有报错与失败测试，回路是一条能给出数字的
+   校验命令（词数、段数、checklist 断言）；注入文案已改成任务中立，收尾退化为数字复核 + 清场。
+
+边界：代码层只能认 `present` 这个动作。**纯文本终稿（没有 `present`）** 只能靠
+`stuck-gate` 技能里的 done-state 自检覆盖——两层互补，别指望插件读模型心思。
+
+## 响应协议（提示词层，`stuck-gate` 技能）
+
+闸门触发后，把验证 / 搜索 / 清场 / 上下文压缩**静默一次性跑完**，期间不输出终稿措辞，
+全部结束后给**一个**结论。禁止「结论 → 一串工具调用 → 又一句结论」的倒挂。
+`[better-debug]` 只是提醒，不需要先用文字回应它。
 
 ## 自带技能
 
@@ -117,14 +141,29 @@ outcome session=… turn=39 after=C first=ops_bash class=verify steps=1
 
 ## 安装
 
+**快装（从 Release tarball，pnpm 会把它当普通包装进 profile）：**
+
 ```bash
-# 1. 放进 local-pkgs（与你现有的 dsh-turn-cleanup 并列）
-cp -r dsh-better-debug ~/.dsh/local-pkgs/
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.1.2/dsh-better-debug-0.1.2.tgz
+```
+
+（这个包**没有**发到 npm registry，所以 `dsh plugin add dsh-better-debug` 会 404；
+要么用上面这条 tarball URL，要么手动 link，见下。）
+
+**手动 link（要改代码就用这个）：**
+
+```bash
+# 1. 放到一个你长期保留的位置。别放临时目录，也别放 node_modules 里
+#    （下面以 ~/dsh-plugins/dsh-better-debug 为例，换成你自己的路径即可）
+mkdir -p ~/dsh-plugins
+cp -r dsh-better-debug ~/dsh-plugins/
 
 # 2. profile 里加 link 依赖
 cd ~/.dsh/profiles/desktop
-# package.json → dependencies 加一行：
-#   "dsh-better-debug": "link:../../local-pkgs/dsh-better-debug"
+# package.json → dependencies 加一行（路径相对 .dsh/profiles/desktop）：
+#   "dsh-better-debug": "link:../../../dsh-plugins/dsh-better-debug"
+# 也可以直接写绝对路径：
+#   "dsh-better-debug": "link:D:/code/dsh-better-debug"
 # package.json → dsh.profile.bundles 数组末尾加：
 #   "dsh-better-debug"
 
@@ -152,6 +191,8 @@ cd ~/.dsh/profiles/desktop
     repeatEditThreshold: 3      # A：同一文件改几次算打转
     repeatErrorThreshold: 2     # B：同一类报错几次算打转
     noVerifySteps: 2            # C：改完几步没验证算打转
+    decayEditsOnVerify: true    # A：一次 verify 到达就清零连续盲改计数（false = 旧行为）
+    doneOnPresent: true         # present 后休眠闸门，下一次写入重新唤醒（false = 旧行为）
     logFile: ""                 # 绝对路径；空 = 不落盘（ctx.logger 只进 stdout）
     panel: true                 # 挂 /better-debug 只读面板；false = 不挂路由
 ```
@@ -165,11 +206,12 @@ cd ~/.dsh/profiles/desktop
    （`ctx.logger` 只进 Electron stdout，事后 grep 不到）。没有 `apply` 行就是没挂上。
 3. 正常干活，日志出现这样一行即为命中：
    ```
-   inject session=… turn=32 step=98 signals=A chars=254 files=1 worstEdits=3 worstErrors=0 searched=false
+   inject session=… turn=32 step=98 signals=A chars=254 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false
    ```
    `signals` 是命中的信号（`A`/`B`/`C`，多条用 `+`）；`files` 是本 turn 碰过的**不同文件数**、
-   `worstEdits` 是其中**最惨那个被改了几次**——判 A 用的是后者。两个数字混着看才不误导：
-   `files=1 worstEdits=3` 才是「盯着一个文件改三遍」。
+   `worstEdits` 是累计改了几次，**`worstStreak` 才是 A 真正用的判据**（自上次 verify 以来的
+   连续盲改次数）。三者混着看：`files=1 worstEdits=3 worstStreak=1` 说明中间夹过测量，不该响。
+   `suppress … reason=done` 表示闸门醒着但处于交付态，故意不出声。
    紧接着还会有 `outcome` 行（见「增益面板 / 为面板新增的埋点」）。
 4. 自证指标：注入后**下一个** `tool/call` 的类别有没有变。
    `edit → edit` 说明它被无视了；`edit → lsp_diagnostics / web_search / 读新文件`
@@ -180,17 +222,19 @@ cd ~/.dsh/profiles/desktop
 
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check client.js
-node test/sim.mjs      # 15 个用例：闸门行为
-node test/panel.mjs    # 17 个用例：日志解析、聚合、注入开销、埋点落盘
+node test/sim.mjs      # 19 个用例：闸门行为
+node test/panel.mjs    # 19 个用例：日志解析、聚合、注入开销、埋点落盘
 npm run verify         # 上面全部
 ```
 
 `test/sim.mjs` 用假 ctx 复刻 agent-loop 的调用顺序（`emitPlain` / `emitWaterfall` /
-`emitSerial`），覆盖 **15 个用例**：A/B/C 各一条正例与反例、幂等、D 段静音、子会话跳过、
+`emitSerial`），覆盖 **19 个用例**：A/B/C 各一条正例与反例、幂等、D 段静音、子会话跳过、
 阈值可调、`enabled:false`、自带技能注册（含正文可取与已去私有化）、宿主无 `skills` 服务时不抛、
-导出形状。**不依赖 DSH 运行时**，改动后先跑它。
+导出形状，外加 4 条 v0.1.2 回归——编辑间有测量不响 / 关掉清零仍响 /
+`present` 后不响 / 关掉 done-state 仍响（两条反向用例保证开关可回滚）。
+**不依赖 DSH 运行时**，改动后先跑它。
 
-`test/panel.mjs` 覆盖 **17 个用例**：带引号与转义的字段切分、三种行型解析、缺 `chars=` 的
+`test/panel.mjs` 覆盖 **19 个用例**：带引号与转义的字段切分、三种行型解析、`worstStreak` 在日志→解析→聚合→面板全链路保留（A 的判据可见）、`suppress` 行可解析且不计入触发（交付态静默可观测）、缺 `chars=` 的
 回退、分布与会话去重、阈值取最后一条 `apply`、`estimate` 只剩实测的注入开销、
 空日志与坏行不抛，
 以及一条端到端——真跑 `apply()` 走完一个 turn，读回日志断言 `inject` 与 `outcome`
@@ -200,6 +244,11 @@ npm run verify         # 上面全部
 
 - 「同一文件」按**绝对路径**判定。删了重建同名文件也算同一处——这通常是对的（说明在同一个
   概念上打转），但如果只是反复改生成文件，把 `repeatEditThreshold` 调大或换个检查点。
+- `done-state` 认的是 `present` 调用，不是「模型说了一句收尾话」。纯文本终稿靠
+  `stuck-gate` 技能的 done-state 自检兜底；若某类任务从不调 `present`，把
+  `doneOnPresent: false` 关掉更省心。
+- 清零判定只看**工具名**，看不懂 `ops_bash` 里跑的是 `npm test` 还是 `ls`（沿用 C 的既有取舍）。
+  宁可把「夹了一次 `ls`」当成一次测量而漏报，也不误伤有回路的收敛。
 - `useVerifying` 只看工具名，看不懂 `ops_bash` 里跑的是 `npm test` 还是 `ls`。
   宁可漏判也不误判成「已验证」。
 - 只在**主会话**生效。多 agent 场景下每个 subagent 各自打转不会被拦——但它们的产物最终

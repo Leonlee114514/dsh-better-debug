@@ -1,6 +1,6 @@
 {
   "name": "dsh-better-debug",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "卡住闸门的代码化：同一文件反复改 / 同一报错反复吃 / 改完不验证，命中就在下一步注入一次提醒，逼出一条几秒能跑的反馈回路。",
   "type": "module",
   "main": "lib/index.js",

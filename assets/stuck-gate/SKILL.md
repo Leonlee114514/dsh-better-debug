@@ -19,6 +19,13 @@ Trigger is **self-detection**, not the user's wording. Fire it the first time an
 
 Fire it **before** the next attempt. Not after.
 
+## 触发前置判断与响应协议
+
+- **done-state**：`present` / 终稿答复已发出、无下次修改在即 → 不落闸；新写入重新武装（插件 `doneOnPresent`）。
+- **有进展的收敛 ≠ 卡住**：数字朝目标收敛、每次修改间有测量回路 → 不算「症状没变、没有新信息」。插件 `decayEditsOnVerify` 在每次 verify 后清零连续盲改计数。
+- **任务类型**：写作/收敛类任务的回路是「词数/段数统计 + checklist 断言」，收尾是数字复核 + 清场，不套 commit / 探针 / 事故复盘。
+- **响应协议**：闸门轮把验证/搜索/清场/压缩静默一次性跑完，再给一个结论；禁止「结论 → 工具串 → 又一句结论」。
+
 **共同敌人**：用昂贵的动作（猜、从零造、第 4 次重试）逃避便宜的动作（验证、搜索、要现场）。
 
 ## The gate: 5 checks, in order, no skipping
