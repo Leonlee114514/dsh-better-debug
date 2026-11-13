@@ -34,23 +34,34 @@ window.__ModuleLoader__.load({
 				children: react_jsx_runtime.jsx("iframe", {
 					className: "bd-frame",
 					src: panelSrc,
-					title: "better-debug 增益面板"
+					title: "better-debug 观测面板"
 				})
 			});
 		}
 
-		/** 需要 slot 注册表；没有就不注册（不抛，闸门本身不依赖这个）。 */
-		const inject = ["slots"];
+		/**
+		 * 不声明静态 inject —— 和宿主侧同一个理由。
+		 *
+		 * cordis 的 `Fiber._refresh()` 只要声明的服务拿不到就不执行 apply：没有报错、
+		 * 没有日志，面板安安静静地不存在。`slots` 属于前端 runtime，版本差异下未必有；
+		 * 而它不在时我们本来就该只是「不注册面板」，而不是整段代码不跑。
+		 * 所以改成 ctx.inject 动态订阅：服务在就挂，不在就跳过。
+		 */
+		const inject = [];
 
 		function apply(ctx) {
-			const slots = ctx?.slots;
-			if (slots === void 0 || typeof slots.inject !== "function") return;
-			slots.inject("settings.section", () => slots.register({
-				name: "settings.section",
-				id: "better-debug",
-				order: 40,
-				label: "better-debug"
-			}, BetterDebugPanel));
+			const mount = (slotCtx) => {
+				const slots = slotCtx?.slots;
+				if (slots === void 0 || typeof slots.inject !== "function") return;
+				slots.inject("settings.section", () => slots.register({
+					name: "settings.section",
+					id: "better-debug",
+					order: 40,
+					label: "better-debug"
+				}, BetterDebugPanel));
+			};
+			if (typeof ctx?.inject === "function") ctx.inject(["slots"], mount);
+			else mount(ctx);
 		}
 
 		exports.apply = apply;

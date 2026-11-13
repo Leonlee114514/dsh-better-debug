@@ -1,10 +1,14 @@
-// 面板的读数验证：解析器、聚合、折算，以及 `outcome` 埋点是否真的落盘。
+// 面板的读数验证：解析器、聚合、折算，以及 inject/outcome/change/measure 埋点是否真的落盘。
 // 和 sim.mjs 一样不依赖 DSH 运行时——面板只认日志文本，所以它天然可单测。
+//
+// 重点守的是「指标不许夸大」这条线（评审 m00176 中6）：
+// 字段只能描述「提示后发生了什么」，不能出现暗示因果的名字（changed / gain / effective）。
 import { readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../lib/index.js'
 import { aggregate, parseLine, parseLog, scanFields, estimateTokens, readAggregate } from '../lib/panel.js'
+import { charsFor, messageText } from '../lib/text.js'
 
 const results = []
 function check(label, pass, detail) {
@@ -23,82 +27,129 @@ function check(label, pass, detail) {
   )
 }
 
-// ── 2. 三种行型各自解析成结构化记录
+// ── 2. 六种行型各自解析成结构化记录
 {
   const inject = parseLine(
-    '2026-11-07T02:38:23.965Z inject session=s-1 turn=39 step=19 signals=C chars=256 files=2 worstEdits=1 worstStreak=1 worstErrors=0 searched=true'
+    '2026-11-07T02:38:23.965Z inject session=s-1 turn=39 step=19 signals=C inj=a1b2c3d4 chars=302 tokens=302 files=2 worstEdits=1 worstStreak=1 worstErrors=0 searched=true measured=yes:ops_bash:fail'
   )
   const outcome = parseLine(
-    '2026-11-07T02:38:40.001Z outcome session=s-1 turn=39 after=C first=ops_bash class=verify steps=1'
+    '2026-11-07T02:38:40.001Z outcome session=s-1 turn=39 inj=a1b2c3d4 after=C first=ops_bash class=verify steps=1 before=edit'
   )
+  const change = parseLine(
+    '2026-11-07T02:38:41.001Z change session=s-1 turn=39 inj=a1b2c3d4 after=C tool=ops_bash class=verify steps=2'
+  )
+  const measured = parseLine('2026-11-07T02:38:39.001Z measure session=s-1 turn=39 tool=ops_bash ok=true exit=0 cleared=2')
+  const arm = parseLine('2026-11-07T02:38:30.001Z arm session=s-1 turn=39 step=8 gap=2')
   const applyLine = parseLine(
-    '2026-11-07T01:24:19.226Z apply pid=17884 logFile=C:/x/better-debug.log A=3 B=2 C=2 panel=true'
+    '2026-11-07T01:24:19.226Z apply pid=17884 logFile=C:/x/better-debug.log A=3 B=2 C=2 budget=3 window=6 panel=true'
   )
   check(
-    'parseLine 认 inject',
+    'parseLine 认 inject（含 inj / tokens / measured）',
     inject.kind === 'inject' && inject.signals.length === 1 && inject.signals[0] === 'C' &&
-      inject.chars === 256 && inject.worstEdits === 1 && inject.worstStreak === 1 && inject.searched === true,
-    `${inject.kind} ${inject.signals} ${inject.chars}`
+      inject.inj === 'a1b2c3d4' && inject.chars === 302 && inject.tokens === 302 &&
+      inject.worstStreak === 1 && inject.searched === true &&
+      inject.measured === 'yes:ops_bash:fail',
+    `${inject.kind} ${inject.signals} inj=${inject.inj} ${inject.measured}`
   )
   check(
-    'parseLine 认 outcome',
-    outcome.kind === 'outcome' && outcome.cls === 'verify' && outcome.first === 'ops_bash' && outcome.steps === 1,
-    `${outcome.kind} ${outcome.cls} ${outcome.first}`
+    'parseLine 认 outcome（含 inj / before）',
+    outcome.kind === 'outcome' && outcome.cls === 'verify' && outcome.first === 'ops_bash' &&
+      outcome.steps === 1 && outcome.inj === 'a1b2c3d4' && outcome.before === 'edit',
+    `${outcome.cls}/${outcome.first} before=${outcome.before}`
   )
   check(
-    'parseLine 认 apply 与阈值',
+    'parseLine 认 change',
+    change.kind === 'change' && change.cls === 'verify' && change.steps === 2 && change.tool === 'ops_bash',
+    `${change.cls} steps=${change.steps}`
+  )
+  check(
+    'parseLine 认 measure（失败的测量照样记 ok=false）',
+    measured.kind === 'measure' && measured.ok === true && measured.exit === 0 && measured.cleared === 2,
+    `ok=${measured.ok} exit=${measured.exit} cleared=${measured.cleared}`
+  )
+  check('parseLine 认 arm', arm.kind === 'arm' && arm.gap === 2, `gap=${arm.gap}`)
+  check(
+    'parseLine 认 apply 与阈值 + 预算',
     applyLine.kind === 'apply' && applyLine.pid === 17884 &&
-      applyLine.thresholds.A === 3 && applyLine.thresholds.B === 2 && applyLine.thresholds.C === 2,
-    JSON.stringify(applyLine.thresholds)
+      applyLine.thresholds.A === 3 && applyLine.thresholds.B === 2 && applyLine.thresholds.C === 2 &&
+      applyLine.budget === 3 && applyLine.window === 6,
+    JSON.stringify({ ...applyLine.thresholds, budget: applyLine.budget, window: applyLine.window })
   )
 }
 
-// ── 3. 老日志没有 chars= 时按信号组合回退，不能算成 0
+// ── 3. 老日志没有 chars= 时按信号组合回退，且回退值与真实文案一致（不再有硬编码漂移）
 {
   const record = parseLine('2026-11-07T02:38:23.965Z inject session=s turn=1 step=2 signals=A+B files=1 worstEdits=3 worstErrors=2 searched=false')
-  check('缺 chars= 时按信号回退', record.chars > 0, `chars=${record.chars}`)
+  check('缺 chars= 时按信号回退', record.chars > 0 && record.chars === charsFor(['A', 'B']), `chars=${record.chars}`)
+  const drift = ['A', 'B', 'C', 'A+B', 'A+C', 'B+C'].filter((tag) => {
+    const signals = tag.split('+')
+    return charsFor(signals) !== messageText(signals.map((kind) => ({ kind, n: 0 }))).length
+  })
+  check('回退长度 == 真实文案长度（无硬编码漂移）', drift.length === 0, drift.length === 0 ? '6 组组合' : drift.join(','))
 }
 
-// ── 4. 聚合：分布、会话去重、折算
+// ── 4. 聚合：分布、会话去重、提示后首个动作、窗口内转向、测量
 {
   const text = [
-    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 panel=true',
+    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true',
     '2026-11-07T02:01:00.000Z bundled skill registered: stuck-gate <- C:/a/SKILL.md',
-    '2026-11-07T02:02:00.000Z inject session=s-1 turn=1 step=3 signals=A chars=254 files=1 worstEdits=3 worstErrors=0 searched=false',
-    '2026-11-07T02:02:10.000Z outcome session=s-1 turn=1 after=A first=ops_bash class=verify steps=1',
-    '2026-11-07T02:03:00.000Z inject session=s-1 turn=1 step=9 signals=C chars=256 files=2 worstEdits=1 worstErrors=0 searched=false',
-    '2026-11-07T02:03:30.000Z outcome session=s-1 turn=1 after=C first=edit class=edit steps=2',
-    '2026-11-07T02:04:00.000Z inject session=s-2 turn=4 step=7 signals=B chars=268 files=0 worstEdits=0 worstErrors=2 searched=false sample="Error: boom"',
-    '2026-11-07T02:04:20.000Z outcome session=s-2 turn=4 after=B first=web_search class=search steps=0'
+    '2026-11-07T02:02:00.000Z inject session=s-1 turn=1 step=3 signals=A inj=i1 chars=305 tokens=200 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no',
+    '2026-11-07T02:02:10.000Z outcome session=s-1 turn=1 inj=i1 after=A first=ops_bash class=verify steps=1 before=edit',
+    '2026-11-07T02:02:11.000Z change session=s-1 turn=1 inj=i1 after=A tool=ops_bash class=verify steps=1',
+    '2026-11-07T02:02:12.000Z measure session=s-1 turn=1 tool=ops_bash ok=true exit=0 cleared=1',
+    '2026-11-07T02:03:00.000Z inject session=s-1 turn=1 step=9 signals=C inj=i2 chars=302 tokens=210 files=2 worstEdits=1 worstStreak=1 worstErrors=0 searched=false measured=no',
+    '2026-11-07T02:03:30.000Z outcome session=s-1 turn=1 inj=i2 after=C first=edit class=edit steps=2 before=ops_read_files',
+    '2026-11-07T02:04:00.000Z inject session=s-2 turn=4 step=7 signals=B inj=i3 chars=302 tokens=205 files=0 worstEdits=0 worstStreak=0 worstErrors=2 searched=false measured=no sample="Error: boom"',
+    '2026-11-07T02:04:20.000Z outcome session=s-2 turn=4 inj=i3 after=B first=web_search class=search steps=0 before=edit',
+    '2026-11-07T02:04:25.000Z change session=s-2 turn=4 inj=i3 after=B tool=web_search class=search steps=3',
+    '2026-11-07T02:04:26.000Z measure session=s-2 turn=4 tool=ops_bash ok=false exit=1 cleared=0'
   ].join('\n')
   const a = aggregate(parseLog(text), { logFile: 'C:/x.log', exists: true, bytes: text.length })
   check(
     '聚合：次数/会话/信号分布',
     a.injects.total === 3 && a.injects.sessions === 2 && a.injects.turns === 2 &&
-      a.injects.bySignal.A === 1 && a.injects.bySignal.B === 1 && a.injects.bySignal.C === 1,
+      a.injects.bySignal.A === 1 && a.injects.bySignal.B === 1 && a.injects.bySignal.C === 1 &&
+      a.injects.chars === 305 + 302 + 302 && a.injects.tokens === 200 + 210 + 205,
     `${a.injects.total} 次 / ${a.injects.sessions} 会话 / A${a.injects.bySignal.A} B${a.injects.bySignal.B} C${a.injects.bySignal.C}`
   )
   check(
-    '聚合：outcome 分类与改变率',
-    a.outcomes.reported === 3 && a.outcomes.byClass.verify === 1 &&
-      a.outcomes.byClass.search === 1 && a.outcomes.byClass.edit === 1 &&
-      Math.abs(a.outcomes.changedRate - 2 / 3) < 1e-9,
-    `changedRate=${a.outcomes.changedRate?.toFixed(3)}`
+    '聚合：提示后首个动作（描述性，不叫 changed）',
+    a.firstAction.reported === 3 && a.firstAction.silent === 0 &&
+      a.firstAction.byClass.verify === 1 && a.firstAction.byClass.search === 1 && a.firstAction.byClass.edit === 1 &&
+      a.firstAction.byTool.ops_bash === 1 && a.firstAction.byTool.web_search === 1,
+    JSON.stringify(a.firstAction.byClass)
   )
   check(
-    '聚合：阈值取最后一条 apply',
-    a.thresholds.A === 3 && a.thresholds.B === 2 && a.thresholds.C === 2,
-    JSON.stringify(a.thresholds)
+    '聚合：窗口内转向率与中位步数（只从 change 算）',
+    a.turned.observed === 3 && a.turned.total === 2 &&
+      a.turned.byClass.verify === 1 && a.turned.byClass.search === 1 &&
+      Math.abs(a.turned.rate - 2 / 3) < 1e-9 && a.turned.medianSteps === 2,
+    `observed=${a.turned.observed} turned=${a.turned.total} median=${a.turned.medianSteps}`
+  )
+  check(
+    '聚合：测量统计把失败也算进回路',
+    a.measures.total === 2 && a.measures.ok === 1 && a.measures.failed === 1 && a.measures.cleared === 1,
+    `ok=${a.measures.ok} failed=${a.measures.failed} cleared=${a.measures.cleared}`
+  )
+  check(
+    '聚合：阈值与预算取最后一条 apply',
+    a.thresholds.A === 3 && a.thresholds.B === 2 && a.thresholds.C === 2 && a.budget === 3 && a.window === 6,
+    JSON.stringify({ ...a.thresholds, budget: a.budget, window: a.window })
   )
   check(
     '聚合：只保留实测的注入开销，没有折算字段',
-    a.estimate.injectionTokens > 0 &&
+    a.estimate.injectionTokens === a.injects.tokens &&
       a.estimate.avoidedTokens === void 0 &&
       a.estimate.netTokens === void 0 &&
       a.estimate.assumedRoundtripTokens === void 0,
     `注入 ${a.estimate.injectionTokens} tok，keys=${Object.keys(a.estimate).join(',')}`
   )
   check('聚合：技能路径取最后一条', a.log.skills === 1 && a.log.skillPath.includes('SKILL.md'), a.log.skillPath)
+  check(
+    '聚合：旧字段名不得复活（changed / changedRate / outcomes）',
+    a.outcomes === void 0 && a.firstAction.changed === void 0 && a.firstAction.changedRate === void 0,
+    `keys=${Object.keys(a).join(',')}`
+  )
 }
 
 // ── 5. 空日志与坏行不能让面板炸
@@ -106,12 +157,41 @@ function check(label, pass, detail) {
   const a = aggregate(parseLog(''), { logFile: '', exists: false, bytes: 0 })
   const bad = parseLog('完全不是日志的一行\n\n2026-11-07T02:00:00.000Z inject session=s turn=1')
   check(
-    '空日志：不炸，改变率为 null',
-    a.injects.total === 0 && a.outcomes.reported === 0 && a.outcomes.changedRate === null,
+    '空日志：不炸，转向率为 null',
+    a.injects.total === 0 && a.firstAction.reported === 0 && a.turned.rate === null && a.turned.medianSteps === null,
     `total=${a.injects.total}`
   )
   check('坏行：跳过而不是抛', bad.length === 2 && bad[0].kind === 'other', `records=${bad.length}`)
   check('缺失文件：exists=false', readAggregate('', {}).log.exists === false)
+}
+
+// ── 5b. 埋点上线前的老日志：不能说成「0% 转向」
+// v0.1 的 inject 行没有 inj=，也就不可能有 change/measure 行。
+// 这时「转向 0 次」是「没测」，不是「测了没有」——rate 必须是 null 而不是 0。
+{
+  const legacy = [
+    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2',
+    '2026-11-07T02:02:00.000Z inject session=s-1 turn=1 step=3 signals=C chars=254 files=1 worstEdits=1 worstStreak=1 worstErrors=0 searched=false',
+    '2026-11-07T02:02:10.000Z outcome session=s-1 turn=1 after=C first=ops_bash class=verify steps=0',
+    '2026-11-07T02:03:00.000Z inject session=s-1 turn=1 step=9 signals=C chars=254 files=2 worstEdits=1 worstStreak=1 worstErrors=0 searched=false',
+    '2026-11-07T02:03:20.000Z outcome session=s-1 turn=1 after=C first=edit class=edit steps=0'
+  ].join('\n')
+  const a = aggregate(parseLog(legacy), { logFile: 'C:/x.log', exists: true, bytes: legacy.length })
+  check(
+    '老日志（无 inj=）：转向率是 null 而不是 0，且 observed=0',
+    a.injects.total === 2 &&
+      a.turned.observed === 0 &&
+      a.turned.total === 0 &&
+      a.turned.rate === null &&
+      a.measures.total === 0,
+    `observed=${a.turned.observed} rate=${a.turned.rate}`
+  )
+  // 但「提示后首个动作」在 v0.1 就有 outcome 行，那部分照常算。
+  check(
+    '老日志：outcome 仍可统计（这部分 v0.1 就有）',
+    a.firstAction.reported === 2 && a.firstAction.byClass.verify === 1 && a.firstAction.byClass.edit === 1,
+    JSON.stringify(a.firstAction.byClass)
+  )
 }
 
 // ── 6. token 折算：CJK 1:1，ASCII 约三分之一
@@ -121,7 +201,7 @@ function check(label, pass, detail) {
   check('estimateTokens 中英分别计', zh === 4 && en > 0 && en < 10, `zh=${zh} en=${en}`)
 }
 
-// ── 7. 端到端埋点：真跑一次 apply，注入后一条 tool/call 必须写出 outcome 行
+// ── 7. 端到端埋点：真跑一次 apply，注入后的行必须全都落盘且能串起来
 {
   const logFile = join(tmpdir(), `better-debug-test-${process.pid}-${Date.now()}.log`)
   const listeners = new Map()
@@ -158,16 +238,31 @@ function check(label, pass, detail) {
       await ctx.emitWaterfall('fs/write-intent', 'C:/work/src/a.js', { agent: { session } }, () => ({ ok: true }))
     }
   }
-  // 注入后的第一条工具调用
+  // 注入后：一次真测量（命令命中判据）+ 它的结果
   await ctx.emitPlain('session/event', session, {
     type: 'tool/call',
-    data: { turn: 1, step: 5, callId: 'c1', name: 'ops_bash', arguments: {} }
+    data: { turn: 1, step: 5, callId: 'c1', name: 'ops_bash', arguments: { command: 'npm test' } }
+  })
+  await ctx.emitPlain('session/event', session, {
+    type: 'tool/result',
+    data: {
+      turn: 1,
+      step: 5,
+      message: {
+        id: 'm-c1',
+        role: 'tool',
+        toolCallId: 'c1',
+        isError: false,
+        source: { kind: 'tool', callId: 'c1' },
+        content: [{ type: 'text', text: '[exit code: 1]' }]
+      }
+    }
   })
   await ctx.emitPlain('session/event', session, { type: 'turn/end', data: { turn: 1 } })
 
   // record() 是 appendFile，插件里刻意不 await（不能因为写日志拖慢每一步）。
   // 所以读回之前得给文件系统一个落盘机会，否则测的是竞态而不是行为。
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await new Promise((resolve) => setTimeout(resolve, 120))
 
   let text = ''
   try {
@@ -176,22 +271,39 @@ function check(label, pass, detail) {
   const records = parseLog(text)
   const inject = records.find((r) => r.kind === 'inject')
   const outcome = records.find((r) => r.kind === 'outcome')
+  const measured = records.find((r) => r.kind === 'measure')
+  const change = records.find((r) => r.kind === 'change')
   check(
-    '埋点：注入行带 chars=',
-    inject !== void 0 && inject.chars > 0 && inject.signals.includes('A'),
-    inject ? `chars=${inject.chars} signals=${inject.signals.join('+')}` : 'no inject line'
+    '埋点：注入行带 chars= 与 inj=',
+    inject !== void 0 && inject.chars > 0 && inject.inj.length > 0 && inject.signals.includes('A'),
+    inject ? `chars=${inject.chars} inj=${inject.inj}` : 'no inject line'
   )
   check(
-    '埋点：注入后首个 tool/call 写出 outcome',
+    '埋点：首个 tool/call 写出 outcome，且带 inj 与 before',
     outcome !== void 0 && outcome.first === 'ops_bash' && outcome.cls === 'verify' &&
-      outcome.after === 'A' && outcome.steps === 5 - injectedAt,
-    outcome ? `${outcome.cls}/${outcome.first} steps=${outcome.steps}` : 'no outcome line'
+      outcome.after === 'A' && outcome.inj === inject?.inj &&
+      // 上一动作是「写入」本身（走 fs/write-intent，没有对应的 tool/call），
+      // 不能变成 '-' —— 否则面板没法说「从改转到了测」。
+      outcome.before === 'write' &&
+      outcome.steps === 5 - injectedAt,
+    outcome ? `${outcome.cls}/${outcome.first} steps=${outcome.steps} before=${outcome.before}` : 'no outcome line'
+  )
+  check(
+    '埋点：测量结果行写出 ok/exit/cleared（失败也是测量）',
+    measured !== void 0 && measured.ok === false && measured.exit === 1 && measured.cleared >= 1,
+    measured ? `ok=${measured.ok} exit=${measured.exit} cleared=${measured.cleared}` : 'no measure line'
+  )
+  check(
+    '埋点：窗口内转向写出 change 行',
+    change !== void 0 && change.after === 'A' && change.tool === 'ops_bash' && change.steps === 5 - injectedAt,
+    change ? `${change.tool} steps=${change.steps}` : 'no change line'
   )
   const a = aggregate(records, { logFile, exists: true, bytes: text.length })
   check(
-    '埋点：聚合把这次算成「换了动作」',
-    a.outcomes.reported === 1 && a.outcomes.changed === 1 && a.outcomes.changedRate === 1,
-    `changedRate=${a.outcomes.changedRate}`
+    '埋点：聚合把这次算成「窗口内转向 1 次」',
+    a.firstAction.reported === 1 && a.firstAction.byClass.verify === 1 &&
+      a.turned.total === 1 && a.turned.rate === 1 && a.measures.total === 1 && a.measures.failed === 1,
+    `turned=${a.turned.total} measures=${a.measures.total}`
   )
 
   try {
@@ -199,11 +311,11 @@ function check(label, pass, detail) {
   } catch {}
 }
 
-// ── 18. A 的判据字段必须在「日志 → parseLine → aggregate.recent → 面板」全链路活下来
+// ── 8. A 的判据字段必须全链路活下来
 {
   const text = [
-    '2026-11-11T00:00:00.000Z inject session=s-1 turn=1 step=4 signals=A chars=254 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false',
-    '2026-11-11T00:00:01.000Z inject session=s-2 turn=1 step=4 signals=A chars=254 files=1 worstEdits=3 worstStreak=1 worstErrors=0 searched=false'
+    '2026-11-11T00:00:00.000Z inject session=s-1 turn=1 step=4 signals=A inj=j1 chars=305 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no',
+    '2026-11-11T00:00:01.000Z inject session=s-2 turn=1 step=4 signals=A inj=j2 chars=305 files=1 worstEdits=3 worstStreak=1 worstErrors=0 searched=false measured=no'
   ].join('\n')
   const records = parseLog(text)
   const a = aggregate(records, { logFile: '', exists: true, bytes: text.length })
@@ -218,10 +330,10 @@ function check(label, pass, detail) {
   )
 }
 
-// ── 19. done-state 的 suppress 行要能被面板读出来（醒着但故意不出声 ≠ 没挂上）
+// ── 9. done-state 的 suppress 行要能被面板读出来（醒着但故意不出声 ≠ 没挂上）
 {
   const text = [
-    '2026-11-11T00:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 panel=true',
+    '2026-11-11T00:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true',
     '2026-11-11T00:00:01.000Z suppress session=s-1 turn=1 step=7 reason=done',
     '2026-11-11T00:00:02.000Z suppress session=s-2 turn=1 step=8 reason=done'
   ].join('\n')
@@ -234,6 +346,23 @@ function check(label, pass, detail) {
       a.log.suppressed === 2 && a.injects.total === 0,
     `suppressed=${a.log.suppressed} injects=${a.injects.total}`
   )
+}
+
+// ── 10. arm 行：解释「改完 N 步为什么没提醒」，且不计入触发
+{
+  const text = [
+    '2026-11-11T00:00:00.000Z arm session=s-1 turn=1 step=9 gap=2',
+    '2026-11-11T00:00:01.000Z arm session=s-1 turn=1 step=10 gap=3'
+  ].join('\n')
+  const a = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length })
+  check('arm 行计数，不算注入', a.log.arms === 2 && a.injects.total === 0, `arms=${a.log.arms}`)
+}
+
+// ── 11. 面板挂载失败要能被看见（不能静默）
+{
+  const text = '2026-11-11T00:00:00.000Z panel register failed: duplicate prefix route'
+  const a = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length })
+  check('panel register failed 被计入', a.log.panelFailed === 1, `panelFailed=${a.log.panelFailed}`)
 }
 
 const failed = results.filter((r) => !r.pass)

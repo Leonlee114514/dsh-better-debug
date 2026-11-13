@@ -6,9 +6,20 @@
 #   enabled: false              → installed but inert (no listener registered)
 #   repeatEditThreshold: 4      → loosen "same file re-edited" from 3 to 4
 #   repeatErrorThreshold: 3     → loosen "same error repeated" from 2 to 3
-#   noVerifySteps: 3            → loosen "edited N steps ago, still no check"
-#   decayEditsOnVerify: false   → 关闭「verify 后清零连续盲改计数」，退回旧 A 行为
+#   noVerifySteps: 3            → 改完 N 步没测量才「上膛」（不等于立刻提醒）
+#   maxInjectsPerTurn: 5        → 单轮最多提醒 5 次（默认 3）
+#   changedWindow: 10           → 注入后多少步内算「转向」窗口（默认 6）
+#   measureCommands: "npm|pnpm" → 覆盖「什么命令算测量」的正则
+#   measureIntent: "验证|测试"   → 覆盖「描述里出现什么算测量意图」的正则
+#   excludePaths: "vendor/"     → 覆盖「哪些路径不算盲改」的正则
+#   decayEditsOnVerify: false   → 关闭「测量后清零连续盲改计数」，退回旧 A 行为
 #   doneOnPresent: false        → 关闭交付态休眠，交付后仍注入
+#   panel: false                → 不挂 /better-debug 只读面板
+#   logFile: "~/my.log"         → 日志换个位置（支持 ~ 展开）
+#   logFile: ""                 → 显式关闭落盘（面板就只剩不到数据了，通常不要）
+#
+# 日志默认落在 $DSH_HOME/logs/better-debug.log（没设 DSH_HOME 就是
+# ~/.dsh/logs/better-debug.log）。开箱就有数据，不用先配置。
 #
 # If you already registered this plugin by hand (manual link + your own
 # `- id: better-debug` row), remove that row first: two rows with the same
@@ -17,13 +28,25 @@
 # Do NOT rename this id to differ from your profile row. Two *different* ids
 # pointing at the same package name mount the plugin twice — two listener sets,
 # every reminder injected twice, every log line doubled.
+#
+# NOTE: no `inject:` here on purpose. cordis resolves entry options.inject into
+# the plugin's dependency set (cordis-plugin-loader `Inject.resolve(
+# entry.options.inject, fiber.inject)`), and Fiber._refresh() skips apply()
+# entirely — silently, with no log line — when any declared service is missing.
+# `skills` comes from @deepseek-ai/dsh-skill, which a trimmed profile or another
+# distribution may not mount; the gate does not need it. Both optional services
+# (skills / webServer) are subscribed dynamically via ctx.inject instead.
+#
+# NOTE: no `config:` block here either, and that one is about the market.
+# DshMarket's hot mount replays *plain* insert rows only — `scanPatch()` in
+# dshmarket/lib/hot.js stops at any other key and reports
+# "the bundle patch has a config block; hot-mount replays plain insert rows
+# only". A config block therefore turns "enable" in the market into "nothing
+# happens until you restart DSH". Every default below is already applied by
+# normalizeConfig() in lib/index.js, so the block bought only self-documentation
+# at the price of a silent no-op for new users. Keep this row to id + name; set
+# overrides under the same id in your own profile's cordis.patch.yml, where a
+# config block is expected and hot mount is not involved.
 - insert:
     - id: better-debug
       name: dsh-better-debug
-      inject: [skills]
-      config:
-        enabled: true
-        repeatEditThreshold: 3
-        repeatErrorThreshold: 2
-        noVerifySteps: 2
-        logFile: ""

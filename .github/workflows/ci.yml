@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        node: [20, 22]
+        node: [20, 22, 24]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +20,8 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: syntax check
         run: npm run check
+      # 24 is what the desktop app actually ships (Electron 44 bundles node 24).
+      # test:posix re-runs both suites with node:path swapped for the posix
+      # implementation, so a Windows runner also covers Linux path semantics.
       - name: behaviour sim (no DSH runtime needed)
         run: npm test

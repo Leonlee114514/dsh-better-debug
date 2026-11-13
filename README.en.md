@@ -4,39 +4,64 @@ Turn a "stuck gate" from prompt text into a **code gate** for [DeepSeek Harness]
 
 The five checks in `AGENTS.md` — and any `stuck-gate` skill — live in the **prompt layer**: the model has to *notice* it is stuck before the rules start applying. The characteristic symptom of being stuck is precisely that it does not notice. So it writes a third "let me try once more", eats the same error for the fourth time, or edits code and runs nothing.
 
-This plugin does not read the model's mind. It watches what the model **does**, and when the behaviour matches "going in circles", it inserts one short user message **before the next step**.
+This plugin does not read the model's mind. It watches what the model **does**, and when the behaviour matches "going in circles", it inserts one short user message **before the next step**:
 
 ```
-[better-debug] 检测到你在原地打转：
-- 同一个文件你连续改了 3 次，中间夹不进任何验证或新信息。
-下一步别急着再改，先做其中一件、拿到新事实再往下走：
-1) 建一条几秒能跑完、能给出数字或事实的回路（失败测试 / 复现命令 / 词数段数统计 / checklist 断言 / lsp_diagnostics）…
-2) 用报错原文整句或需求关键词 + 版本搜一次，10 分钟盒，GitHub closed issue 也看。
-3) 拿到新证据后，一次只动一个变量；数字朝目标收敛且每步有测量 = 有进展，不算打转。
+[better-debug] 观察到的重复动作（只是观察，不是结论）：
+- 同一个文件连续改了 3 次，中间没有任何测量。
+下一步（挑一条就够）：
+1) 建一条几秒能跑完、能给出数字或事实的回路（失败测试 / 复现命令 / 一条断言 / lsp_diagnostics）；建不出来就停下要现场产物。
+恢复条件：拿到一条新的测量结果或一条外部事实后，继续动手即可。
 完整五条：skill `stuck-gate`。
 ```
 
-## Three signals
+(The injected text is Chinese to match the `AGENTS.md` it enforces; change `assets/stuck-gate/SKILL.md` and `lib/text.js` for other languages.)
+
+## Three signals (v0.2 semantics)
 
 | Signal | Trigger | Default | Why |
 | --- | --- | --- | --- |
-| **A** same file, edited **without any check in between** | `fs/write-intent` per absolute path; **any verify clears the streak** | 3rd time | Grinding on one point with no new facts is the clearest "guessing without a loop" |
-| **B** same error, eaten again | `tool/result` error fingerprint dedupe, and no search this turn | 2nd time | Twice means the first read didn't stick — also catches "should have searched, didn't" |
-| **C** edited, never verified | N steps since the last write with no verify and no search | 2 steps | "Change and move on" is the most common missing check |
+| **A** same file, edited **with no measurement in between** | `fs/write-intent` per absolute path; the streak clears only **after a real measurement returns a result**, and only for that directory | 3rd time | Grinding on one point with no new facts is "guessing without a loop" |
+| **B** same **operation** failing again | `tool/result` counted per episode keyed on `tool \| target \| fingerprint`; immune only if that episode was followed by a search | 2nd time | Twice means the first read didn't stick; per-episode, so a search about something else no longer exempts it |
+| **C** edited, then **acted again** with no loop | N steps after a write with no measurement → **arm only**; the reminder comes **before the next write** | 2 steps | "Change and move on" is the most common missing check — but reading code must not be interrupted |
 
-Error fingerprints are normalised — `0x1f3a2b9c` → `<hex>`, `C:\Users\...` → `<path>`, `42` → `<n>` — so an error whose line number moved but whose class didn't still counts as the same error.
+All three rest on the concept of a **measurement**, not on "some tool was called".
 
-**Search tools** (a hit clears both B and C): `web_search` `research` `advanced_search` `multi_search` `platform_search` `domain_search` `cache_search` `video_search`
+### What counts as a measurement
 
-**Verify tools** (clears A's blind-edit streak and C): `ops_bash` `lsp_diagnostics` `verify` `run_tests`
+"Tool was called" ≠ "measurement completed". That was v0.1's biggest hole: in `edit → ls → edit → edit`, the `ls` whitewashed the blind-edit streak, so real circling did not fire.
 
-> The reset is deliberate: a word count converging 725 → 664 → 601 → 591 with a measurement
-> after every edit is *loop-driven iteration*, not circling. The old cumulative counter
-> mis-fired on exactly that. `decayEditsOnVerify: false` restores the old behaviour.
+v0.2 splits it into two states: **measurement intent** (decided at `tool/call` from the arguments) and **measurement result** (booked when `tool/result` comes back). Only a returned result clears a streak, and only for the files related to that command's directory — running `npm test` in `C:/other` must not clear the streak on `C:/work/src/target.js`.
+
+| Class | Tools | Criterion |
+| --- | --- | --- |
+| Hard measurement | `lsp_diagnostics` `verify` `run_tests` `run_test` | always a measurement |
+| Soft measurement | `ops_bash` `bash` `shell` `pwsh` | command matches `measureCommands`, or the description matches `measureIntent` while the command does not start with `ls/dir/cat/type/head/tail` |
+| Search | `web_search` `research` `advanced_search` `multi_search` `platform_search` `domain_search` `cache_search` `video_search` | a hit counts as new external facts |
+| Method | `skill` | loading methodology is a real turn of action; counted separately, not folded into `other` |
+| Edit | `edit` `write` `ops_write` `str_replace` `apply_patch` `notebook_edit` | |
+
+**A failing test is still a valid measurement**: it tells you which line broke. `[exit code: 1]` clears the streak and counts as a loop just the same; the panel merely records `ok=false`.
+
+`DEFAULT_MEASURE_COMMANDS` covers `npm/pnpm/yarn/bun` + `test|verify|check|lint|typecheck|build`, `node --test`, `pytest`, `vitest`, `jest`, `mocha`, `go test`, `cargo test`, `dotnet test`, `tsc`, `eslint`, `ruff check`, `mypy`, `git diff --stat`. For non-code tasks, override `measureCommands` with your own regex (word counts, section counts, anything that yields a number or a fact).
+
+**Generated files do not count as blind edits**: `node_modules`, `dist`, `build`, `out`, `coverage`, `.git`, `.next`, `.cache`, lock files, `*.log` / `*.map` / `*.min.js` are excluded via `excludePaths`.
+
+### Error episodes (B's key)
+
+```
+tool name | target | error fingerprint
+```
+
+- **target** is the first path-like token in the error text (`C:/work/a.js`), with numbers normalised to `<n>`;
+- **fingerprint** is the first 16 hex chars of a sha256 over the normalised first 6 lines / 300 chars, with `0x1f3a2b9c`→`<hex>`, paths→`<path>`, `42`→`<n>`.
+
+So an error whose line number moved but whose class did not is the same episode, while **two different files each failing ENOENT once are not**.
 
 ## What it deliberately does not do
 
 - **No "I guess it's…" phrasing detection.** The plugin cannot see the model's inner monologue. That check stays in the `stuck-gate` skill, where self-detection belongs.
+- **No no-op write detection.** `fs/write-intent` only carries a freshness token (`FsVersion` or `createIfAbsent`), never the content, so the plugin layer cannot diff.
 - **No probe cleanup at turn end.** That belongs to a turn-cleanup plugin.
 - **Never `reject`.** Rejecting turns the whole turn into a no-op. The plugin only appends one user message to the tail of `messages`.
 - **Never fires in subagent sessions.** `header.origin === 'subagent'` or `delegationDepth > 0` is skipped: their cwd may be someone else's workspace and their counters are not comparable.
@@ -45,184 +70,288 @@ Error fingerprints are normalised — `0x1f3a2b9c` → `<hex>`, `C:\Users\...` �
 
 When the user explicitly says *don't search, just make the change, just try it quickly*, the gate must stand down. The plugin implements this by scanning this turn's **user** messages for `别搜|不要搜|不用搜|先别搜|直接改|快速试|别折腾|先试试` and going silent for the whole turn. Only `source.kind === 'user'` counts — the plugin's own injected message is ignored.
 
-## Idempotence
+## Idempotence and re-arming
 
-Each signal fires at most once per turn, **and** a new fact (another write, another error) must have appeared since the last reminder. Both conditions are required; without the second one the model would be nagged on every step and the turn would never end.
+Not "each signal once per turn" — that would leave the second phase of a long turn unattended. v0.2 is **once per stuck episode**:
+
+- the same situation is not repeated (`lastFireMark`'s write and error sequence numbers both unchanged → stay quiet);
+- **a valid measurement re-arms it**: `fired.A/C` reset to zero, so a new bout of blind editing later in the same turn can be flagged again;
+- **a per-turn budget** `maxInjectsPerTurn` (default 3) keeps it from becoming a drumbeat.
 
 When A or B fires, C is marked as already fired too: A/B already describe the situation, and adding "and you didn't verify" is just a restatement.
 
-## Trigger preconditions (v0.1.2)
+## Trigger preconditions
 
 The gate governs **before the next attempt**, not after delivery. Three checks run first:
 
-1. **done-state**: a `present` call happened this turn and no new write followed → **no injection**;
-   a `suppress … reason=done` line is written. The next `fs/write-intent` re-arms the gate.
-   Switch: `doneOnPresent: false`.
-2. **Converging with progress**: see the streak reset above. Switch: `decayEditsOnVerify: false`.
-3. **Task kind**: writing / word-count calibration has no error or failing test; its loop is a
-   command that prints numbers (word/paragraph counts, checklist assertions). The injected
-   wording is task-neutral and the wrap-up degrades to number re-check + cleanup.
+1. **done-state**: a `present` call that **succeeded** (`isError !== true`) happened this turn → **no injection**; a `suppress … reason=done` line is written. **A failed `present` does not sleep the gate** — the deliverable never went out, so the gate stays awake. The next `fs/write-intent` re-arms it. Switch: `doneOnPresent: false`.
+2. **Loop-driven convergence**: see "what counts as a measurement" above. Switch: `decayEditsOnVerify: false`.
+3. **Task type**: writing, word-count calibration and layout convergence have no errors and no failing tests; their loop is a command that yields a number. The injected text is task-neutral.
 
-Limit: code can only see the `present` **action**. A plain-text final answer with no `present`
-is covered by the done-state self-check inside the `stuck-gate` skill. The two layers complement
-each other; the plugin does not read the model's mind.
+Boundary: the code layer can only recognise the `present` *action*. **Plain-text final answers (no `present`)** are covered only by the done-state self-check inside the `stuck-gate` skill — the two layers complement each other; don't expect the plugin to read minds.
+
+## The injected text
+
+Three rules:
+
+1. **State the observation, don't diagnose.** The old first line ("检测到你在原地打转" — "you are going in circles") labelled the model. Now it reads "观察到的重复动作（只是观察，不是结论）" — "observed repeated actions (an observation, not a conclusion)".
+2. **At most two actions.** More than that is the same as none.
+3. **Always give a recovery condition.** "How to continue" is more useful than "you're wrong".
+
+The single source for this text is `lib/text.js`, shared by `index.js` (injection) and `panel.js` (back-filling character counts for old logs), so the panel's length estimate cannot drift from the real text.
 
 ## Response protocol (prompt layer, `stuck-gate` skill)
 
-Once the gate fires, run every tool action (verify, search, cleanup, context compression)
-**silently in one batch**, emit no final-sounding prose in between, and give **one** conclusion
-at the very end. No "conclusion → string of tool calls → another conclusion" inversion.
-`[better-debug]` is a reminder, not a message that needs a textual reply.
+After the gate fires, run verification / search / cleanup / context compression **silently, in one pass**, emit no final-answer phrasing during it, then give **one** conclusion. The inverted pattern — conclusion → a run of tool calls → another conclusion — is forbidden. `[better-debug]` is a reminder; it does not need a prose reply first.
 
 ## Bundled skill
 
-The package ships `assets/stuck-gate/SKILL.md` and registers it as a **bundled skill** through `inject: ["skills"]` (`source: "bundled"`, `rank: 600`). It appears in the model-visible skill catalog as soon as the plugin is installed — no copying files around. That is what the tail of the reminder points at.
+The package ships `assets/stuck-gate/SKILL.md` and registers it as a **bundled skill** via `inject: ["skills"]` (`source: "bundled"`, `rank: 600`) — it appears in the model-visible skill catalogue after install, no file copying needed.
 
-Rank table (lower wins):
+The reminder ends with "完整五条：skill `stuck-gate`", pointing at this one.
+
+**Rank order** (lower wins):
 
 | rank | source | who speaks |
 | --- | --- | --- |
 | 100–200 | project `.dsh/skills`, `.agents/skills` | project override |
 | 300 | `custom` | |
-| 400 | `~/.dsh/skills` (user global) | **your own copy overrides the bundled one** |
+| 400 | `~/.dsh/skills` (user global) | **your own copy beats the plugin's** |
 | 500 | `~/.agents/skills` | |
-| 600 | this plugin's `assets/` | the default wording |
+| 600 | this plugin's `assets/` | default text |
 
-So you can rewrite the gate's wording **without touching code**: drop a `~/.dsh/skills/stuck-gate/SKILL.md` and it wins. Editing the copy inside `assets/` applies to everyone who installs the plugin, and takes effect without a restart (`get()` re-reads the file).
+So changing the gate wording needs no code change: drop a copy at `~/.dsh/skills/stuck-gate/SKILL.md` and it takes effect. Editing the copy inside the plugin applies to everyone (the file is re-read on every `get()`, no restart needed).
 
-On a host without a `skills` service the registration is skipped and logged; the gate itself keeps working.
+If the host has no `skills` service (older DSH), registration is skipped with one log line and **the gate itself keeps working**.
 
-## Gain panel
+## The observation panel
 
-A log file is readable only to the person who wrote it. The panel turns it into something you can look at: **Settings → better-debug**, an iframe view that refreshes every 5 seconds, read-only, with no effect on plugin behaviour.
+Logs are only loved by the person who wrote them. The panel turns them into something you can read at a glance: **Settings → better-debug**, an iframe view, 5-second auto-refresh, read-only, it never changes plugin behaviour.
 
-Three headline cards:
+Four cards:
 
-| Card | Source | What it tells you |
+| Card | Source | What it can tell you |
 | --- | --- | --- |
-| Gate firings | every `inject` line | how many times the reminder spoke, grouped by `A/B/C` and by combination tag |
-| Sessions covered | distinct `session=` across `inject` lines | how many sessions and turns were affected, and how many characters were injected in total |
-| Model changed course | `class=` on `outcome` lines | **the only objective effect metric**: after the reminder, did the next `tool/call` go verify/search, or keep editing |
+| Gate fires | every `inject` line | how many reminders were spoken, grouped by `A/B/C` and combinations |
+| Sessions covered | distinct `session=` on `inject` lines | how many sessions, turns, characters and tokens of injected text |
+| **First action after a reminder** | `class=` on `outcome` lines | what class the first `tool/call` after a reminder was. **Descriptive. Proves no causation.** |
+| **Measurement loops (hard evidence)** | `measure` lines | how many real measurements happened, how many passed, how many failed, how many streaks were cleared |
 
-It also makes one thing visible: **with no `outcome` lines, "changed course" is empty**. The panel will not invent a percentage for you.
+Plus three distributions: signals, first-action class (six), and **whether it actually turned to obtain new facts within the window** (`change` lines, with a real median step count).
 
-### The instrumentation the panel needed
+### Metric naming discipline
 
-After an injection, the plugin waits for the **first** subsequent `tool/call` and writes:
+This is where v0.1's panel was most misleading; v0.2 splits it apart:
+
+- The name **"reaction rate" is gone**. It computed "the first tool after a reminder was verify/search", which cannot prove the reminder caused the change, let alone that it helped find a defect — the model might have done that next anyway. It is now **"first action after a reminder"**, field `firstAction`.
+- To know whether it turned to new facts within a window, read `turned` (computed only from `change` lines, with a genuine median). That median has samples only here — v0.1's `medianSteps` was always `null` because the outcome line was written on the very next step, so the step delta was always 0.
+- **Old logs are never counted as "0% turned".** v0.1's `inject` lines carry no `inj=`, so they cannot have `change` / `measure` lines either; "0 turns" there means **not measured**, not "measured as zero". `turned.observed` is the denominator and counts only injections after the instrumentation landed; `rate` is `null` when `observed = 0`, and the panel says "this log predates the v0.2 instrumentation". In the real log all 55 injections are in the old format, so `observed = 0` — the panel now says exactly that instead of reporting 0% over 49 outcome lines.
+- "What these numbers do not prove" is printed in the footer: proving a gain needs a control group or historical replay, and the panel does neither.
+- **No estimate of "tokens saved".** The plugin's job is to record what is observable and leave judgement to the reader.
+
+### Instrumentation added for the panel
+
+Every injection gets an `inj=` (8-hex) id that later lines carry, so one reminder's whole life is traceable:
 
 ```
-outcome session=… turn=39 after=C first=ops_bash class=verify steps=1
+inject  session=… turn=39 step=88 signals=A inj=78ed6bc3 chars=309 tokens=271 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
+arm     session=… turn=39 gap=2
+outcome session=… turn=39 inj=78ed6bc3 after=A first=ops_bash class=verify steps=1 before=write
+measure session=… turn=39 tool=ops_bash ok=false exit=1 cleared=1
+change  session=… turn=39 inj=78ed6bc3 after=A tool=ops_bash class=verify steps=1
+suppress session=… turn=39 reason=done
 ```
 
-- `after` is the signal tag of the injection that triggered it;
-- `first` is what the model actually did next, with `class` binned as `verify` / `search` / `edit` / `other`;
-- `steps` is how many steps it took to act (`0` = it switched on the very next step).
-
-Only the first one is recorded: a late verification must not whitewash the earlier circling.
-
-`inject` lines also gained `chars=` (the character count of the injected text); the "cost per injection" figure on the panel is derived from it. Older logs lack the field; the parser backfills from the signal combination (`A=254` / `B=268` / `C=256` / `A+B=307` chars).
-
-### Three self-imposed rules
-
-1. **Every number is counted.** Firings, sessions, distribution read line by line from the log; injection cost comes from `chars=`.
-2. **"Changed course" only counts observations.** The denominator is injections that were actually followed by a tool call, not all injections.
-3. **No estimate of "tokens saved".** That figure would require assuming the model *would* have failed and gone around again — it is invented data. The plugin records what is observable and leaves the judgement to the reader.
+- `outcome` records only the **first** subsequent `tool/call`: a late verification must not whitewash earlier circling. `before=` is the action preceding the reminder (writes count, so the common value is `write`).
+- `change` is written only within `changedWindow` (default 6) steps of an injection; outside the window it is discarded.
+- `measure` is written for every measurement result, with `ok` / `exit` / `cleared` (how many files' streaks were cleared).
+- For old logs with no `chars=`, the parser recomputes the text length through `charsFor(signals)` from `lib/text.js`. v0.1's hard-coded table (`A=254` etc., off by ~50 characters) is deleted.
 
 ### Turning the panel off
 
 `config: { panel: false }`. The route is not mounted, `/better-debug` returns 404, the gate is unaffected.
 
-The route is mounted with `ctx.inject(['webServer'], …)` — **dynamic injection**, deliberately not added to `export const inject`. That would be a structural change: it breaks hot reload, and it would stop the gate from installing at all on a host without `webServer`. On such a host the log gets one `panel unavailable: …` line and everything else keeps working.
+The route is mounted via `ctx.inject(['webServer'], …)` — a **dynamic injection**, not part of `export const inject`. Adding it there is a structural change that breaks hot reload and would stop the gate from installing on hosts without a `webServer`. When the host lacks one, the log gets `panel unavailable: …`; when mounting throws, `panel register failed: …` — and the panel displays it.
 
 ## Install
 
-**Quick install (from the Release tarball; pnpm treats it as an ordinary package):**
+**Quick (Release tarball; pnpm treats it as a normal package):**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.1.2/dsh-better-debug-0.1.2.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.0/dsh-better-debug-0.2.0.tgz
 ```
 
-(This package is **not** published to the npm registry, so `dsh plugin add dsh-better-debug`
-returns 404. Use the tarball URL above, or link it by hand — see below.)
+(This package is **not** published to the npm registry, so `dsh plugin add dsh-better-debug` will 404. Use the tarball URL above, or link manually as below.)
 
-**Manual link (use this if you want to edit the code):**
+**Manual link (use this if you want to change the code):**
 
 ```bash
-# 1. put it somewhere you keep long-term. Not a temp dir, not inside node_modules.
-#    (~/dsh-plugins/dsh-better-debug below is just an example — use your own path)
+# 1. Put it somewhere permanent. Not a temp dir, not inside node_modules.
+#    (~/dsh-plugins/dsh-better-debug is used below as an example.)
 mkdir -p ~/dsh-plugins
 cp -r dsh-better-debug ~/dsh-plugins/
 
-# 2. link dependency in the profile
+# 2. Add the link dependency to your profile
 cd ~/.dsh/profiles/desktop
-# package.json → dependencies (path is relative to .dsh/profiles/desktop):
+# package.json → dependencies, one line (path relative to .dsh/profiles/desktop):
 #   "dsh-better-debug": "link:../../../dsh-plugins/dsh-better-debug"
-# an absolute path works too:
+# An absolute path works too:
 #   "dsh-better-debug": "link:D:/code/dsh-better-debug"
-# package.json → dsh.profile.bundles, at the end:
+# package.json → dsh.profile.bundles, append:
 #   "dsh-better-debug"
 
-# 3. let the bundle patch mount it, or write your own row:
+# 3. Let the bundle patch mount it (if bundles already lists it, dsh applies the
+#    package's cordis.patch.yml automatically), or write your own row in the
+#    profile's cordis.patch.yml:
 #      - id: better-debug
 #        name: dsh-better-debug
-#        inject: [skills]
-#        config: { enabled: true }
+#    Note: do **not** add `inject: [skills]` — see "Why no static inject" below.
+#    The package's own row also carries **no config** — see "Why the bundle patch
+#    has no config".
 
-# 4. restart DSH. Adding `skills` to inject is a structural change; HMR may not pick it up.
+# 4. Restart DSH.
 ```
 
-The panel needs no extra inject: it mounts its route by dynamic injection, so `export const inject` keeps declaring only `skills`. Open **Settings → better-debug**, or go straight to `http://<web-origin>/better-debug`.
+> **Do not use both mounting paths.** The package's `cordis.patch.yml` already contains a `- id: better-debug` row. Writing the same id again in your profile makes cordis reject the duplicate. Two rows with **different** ids pointing at the same package name are worse: the plugin mounts twice, every reminder is injected twice, every log line is written twice.
+
+### Why no static inject
+
+`export const inject` is empty, and `cordis.patch.yml` declares no `inject:` — both on purpose.
+
+cordis's `Fiber._refresh()` takes the whole fiber INACTIVE and **skips `apply()` entirely** when any declared service is unavailable: no error, no log line, the panel looks installed while not a single line of plugin code ever ran. The loader also merges the YAML entry's `inject:` into that dependency set (`cordis-plugin-loader`: `Inject.resolve(entry.options.inject, fiber.inject)`), so fixing the code alone is not enough — the config row would still wedge it.
+
+`skills` is provided by `@deepseek-ai/dsh-skill`. A trimmed profile, another distribution, or simply not enabling that package leaves it absent — and the gate does not need it. Both optional services (`skills` / `webServer`) are therefore subscribed dynamically with `ctx.inject(['skills'], cb)`: present, they attach; absent, you lose one optional feature and the gate keeps working.
+
+The panel follows the same rule: `client.js` skips registration when `slots` is absent. Open **Settings → better-debug**, or visit `http://<web-origin>/better-debug`.
+
+### Why the bundle patch has no config
+
+The package's `cordis.patch.yml` is two lines — `id` and `name` — with no configuration key at all. The reason is that DshMarket's hot mount replays **plain insert rows only**:
+
+```js
+// dshmarket/lib/hot.js
+export function parseSimplePatch(patchText) {
+  const scan = scanPatch(patchText)
+  return scan.blocker === null ? scan.rows : null   // any other key → null
+}
+```
+
+`scanPatch()` stops at `config:` and marks the whole patch `blocker: 'config'`, and the market then tells the user "the bundle patch has a config block; hot-mount replays plain insert rows only — a restart loads the bundle as written". In other words: with a config block, clicking **Enable** in the market does nothing until DSH restarts, which is exactly where a new user concludes the plugin is broken.
+
+Every default already lives in `normalizeConfig()` in `lib/index.js`. The config block bought only self-documentation, at the price of a silent no-op for newcomers. So the defaults stay in code, and a config block belongs in your profile row — that row is not part of the package's hot mount.
 
 ## Configuration
+
+All defaults live in `normalizeConfig()` in `lib/index.js`; it runs as installed. To change one, write the same id (`- id: better-debug`) into **your own profile's** `cordis.patch.yml` with a `config:` block — do not edit the package's copy (an upgrade overwrites it, and a config block there breaks the market's hot mount):
 
 ```yaml
 - id: better-debug
   name: dsh-better-debug
-  inject: [skills]
   config:
     enabled: true
-    repeatEditThreshold: 3      # A: how many edits to the same file counts as circling
-    repeatErrorThreshold: 2     # B: how many identical errors count as circling
-    noVerifySteps: 2            # C: how many steps without a check counts as circling
-    decayEditsOnVerify: true    # A: a verify resets the blind-edit streak (false = old behaviour)
-    doneOnPresent: true         # sleep after present; next write re-arms (false = old behaviour)
-    logFile: ""                 # absolute path; empty = no file (ctx.logger only reaches stdout)
-    panel: true                 # mount the read-only /better-debug panel; false = no route
+    repeatEditThreshold: 3        # A: consecutive edits to one file
+    repeatErrorThreshold: 2       # B: repeats of one error episode
+    noVerifySteps: 2              # C: steps without measurement before arming
+    maxInjectsPerTurn: 3          # reminders per turn, maximum
+    changedWindow: 6              # steps after an injection that count as "turned"
+    decayEditsOnVerify: true      # a measurement clears the blind-edit streak (false = old behaviour)
+    doneOnPresent: true           # a successful present sleeps the gate; next write re-arms (false = old behaviour)
+    measureCommands: ""           # regex overriding "what command is a measurement"; empty = built-in list
+    measureIntent: ""             # regex overriding "what description signals measurement intent"
+    excludePaths: ""              # regex overriding "which paths never count as blind edits"
+    logFile: "~/.dsh/logs/better-debug.log"  # `~` is expanded; omit the key to get this default
+    panel: true                   # mount the read-only /better-debug panel; false = no route
 ```
 
-Tighter (fires more often) → smaller numbers. Looser → bigger. With `enabled: false` no listener is registered at all.
+Tighter (fires more) → smaller numbers; looser → larger. With `enabled: false` not even a listener is registered. A bad regex in the three regex keys **falls back to the built-in default** and logs a warning; it never kills the plugin.
 
-## How to tell it is actually running
+`logFile` has four forms:
 
-1. Point `logFile` at an absolute path, e.g. `~/.dsh/logs/better-debug.log`.
-2. On load you get `apply pid=… logFile=… A=3 B=2 C=2 panel=true`. **That line is the only proof the plugin is mounted** — `ctx.logger` only reaches the Electron stdout and cannot be grepped afterwards. No `apply` line means it never loaded.
+| Value | Where it goes |
+| --- | --- |
+| key omitted | `$DSH_HOME/logs/better-debug.log` (`~/.dsh/logs/better-debug.log` when `DSH_HOME` is unset) |
+| `"~/my.log"` | expanded to `my.log` under your home dir (`~`, `~/x` and `~\x` all work) |
+| `"C:/x.log"` / `"/var/log/x.log"` | used verbatim |
+| `""` or `false` | **explicitly disables the file**. `ctx.logger` only reaches Electron stdout and cannot be grepped later, so the panel then has nothing to show |
+
+Not writing a file was the v0.1 default, and the cost was new users installing it, opening the panel, seeing four empty cards and concluding the plugin was broken. It now writes out of the box.
+
+## Verifying it really works
+
+1. After installing and restarting, the log is already at `$DSH_HOME/logs/better-debug.log` — no configuration needed. Set `logFile` to move it.
+2. Loading writes one `apply pid=… logFile=… A=3 B=2 C=2 budget=3 window=6 panel=true` line — **the only proof the plugin loaded at all** (`ctx.logger` only reaches Electron stdout and cannot be grepped later). No `apply` line means it is not mounted.
 3. Work normally; a hit looks like:
    ```
-   inject session=… turn=32 step=98 signals=A chars=254 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false
+   inject session=… turn=32 step=98 signals=A inj=78ed6bc3 chars=309 tokens=271 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
    ```
-   `signals` lists the fired signals (`A`/`B`/`C`, joined by `+`). `files` is the number of **distinct** files touched; `worstEdits` is the cumulative count; **`worstStreak` is what A actually keys off** (blind edits since the last verify). Read all three: `files=1 worstEdits=3 worstStreak=1` means checks were interleaved, so the gate should stay quiet. A `suppress … reason=done` line means the gate was awake but deliberately silent in delivery state. An `outcome` line follows (see the panel section).
-4. Self-check metric: does the **next** `tool/call` after an injection change category? `edit → edit` means it was ignored; `edit → lsp_diagnostics / web_search / reading a new file` means the reminder landed. Persistently under 30% means the wording or the thresholds need work — not that you need more signals. **The plugin now records this itself** (`outcome` lines); the panel reports it as the "changed course" rate.
+   `signals` lists the fired signals (`A`/`B`/`C`, `+`-joined); `files` is the number of **distinct** files touched this turn; `worstEdits` is the cumulative count; **`worstStreak` is the criterion A actually uses** (consecutive blind edits since the last measurement). Read all three together: `files=1 worstEdits=3 worstStreak=1` means a measurement happened in between and it should not have fired. `suppress … reason=done` means the gate is awake but in delivery state and deliberately silent. `arm … gap=2` means C only armed — it is waiting for your next write.
+4. Do **not** judge it by "was the next action a verify". Look at two things: whether `measure` lines appear at all (hard evidence that a measurement happened), and the `steps=` on `change` lines (how many steps later it turned to new facts). If there are `outcome` lines but no `measure` lines, the model merely switched tools without building a loop.
 
 ## Local verification
 
 ```bash
-node --check lib/index.js && node --check lib/panel.js && node --check client.js
-node test/sim.mjs      # 19 cases: gate behaviour
-node test/panel.mjs    # 19 cases: log parsing, aggregation, injection cost, instrumentation
-npm run verify         # all of the above
+node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
+node test/sim.mjs           # 37 cases: gate semantics + portability
+node test/panel.mjs         # 32 cases: log parsing, aggregation, instrumentation
+npm run test:posix          # re-runs both suites under POSIX path semantics
+npm run verify              # all of the above (with syntax checks)
 ```
 
-`test/sim.mjs` replays the agent-loop call order with a fake ctx (`emitPlain` / `emitWaterfall` / `emitSerial`) and covers **19 cases**: positive and negative for each of A/B/C, idempotence, the quiet exception, subagent skip, adjustable thresholds, `enabled: false`, bundled-skill registration (including that the body is readable and de-privatised), a host without a `skills` service, the export shape, plus four v0.1.2 regressions — interleaved checks stay quiet / switching decay off still fires / `present` stays quiet / switching done-state off still fires (the last two make both switches reversible). It needs **no DSH runtime**, so run it after every change.
+`test/sim.mjs` uses a fake ctx that replicates agent-loop call order (`emitPlain` / `emitWaterfall`) and covers **37 cases**.
 
-`test/panel.mjs` covers **19 cases**: field splitting with quotes and escapes, parsing of all three line types, `worstStreak` surviving log → parse → aggregate → panel (A's actual criterion stays visible), `suppress` lines parsed and excluded from injections (delivery-state silence is observable), the `chars=` backfill, distribution and session de-duplication, thresholds taken from the last `apply`, `estimate` carrying only the measured injection cost, empty logs and junk lines not throwing, plus one end-to-end run — a real `apply()` walks one turn, then the log is read back to assert both the `inject` and `outcome` lines were written and that aggregation counts it as "changed course". Also runtime-free.
+Semantics (each with a positive and a negative):
 
-## Known limits
+- **Intent vs. result**: `edit → ls → edit → edit` still fires; a call with no result does not clear; a failing test is not a blind edit; a measurement in an unrelated directory does not clear the target file's streak.
+- **B's episodes**: only the same target and fingerprint accumulate; two different files each failing ENOENT once do not fire; a search after that episode grants immunity (a search *before* it does not).
+- **C's two stages**: after an edit, reading code alone does not interrupt; arming followed by another write does.
+- **Re-arming**: A fires → a valid measurement restores → a new bout of blind edits may fire a second time; the per-turn budget applies.
+- **Delivery state**: no injection after a successful `present`; **a failed `present` does not sleep the gate**.
+- Observation-only wording, lock files excluded, the "just fix it" exception, subagent skip, adjustable thresholds, `decayEditsOnVerify: false` restoring old behaviour, `enabled: false`, bundled-skill registration and de-privatised content, no `skills` service not throwing, export shape, plus 13 classification/criterion/fingerprint unit assertions.
 
-- "Same file" is judged by **absolute path**. Deleting and recreating a file of the same name still counts as the same spot. That is usually right (you are circling one concept), but if you are legitimately regenerating a file, raise `repeatEditThreshold` or move the checkpoint.
-- Verification is detected **by tool name only** — it cannot tell whether `ops_bash` ran `npm test` or `ls`. It deliberately under-reports rather than risk marking something "verified" that wasn't.
-- **Main sessions only.** In a multi-agent setup, each subagent circling on its own is not intercepted — but their output converges on the lead, so the lead's counters still work.
-- The panel is a **read-only view over the log**, not monitoring: it writes nothing and never changes a gate decision. With an empty `logFile` it shows "no logFile configured" and every statistic is 0.
-- The panel's `changedRate` denominator is injections that were **observed** to be followed by a tool call. An injection followed by an immediate turn end is excluded, so the percentage swings hard on small samples — read the order of magnitude, not a KPI.
+**No DSH runtime required** — run it first after any change.
+
+### Why there is a `test:posix` pass
+
+Every path in `test/sim.mjs` is written in Windows dialect (`C:/work/...`). The suite still
+runs on a Linux box, but it exercises a *different* set of semantics — which was exactly a
+real incident before v0.2:
+
+`node:path`'s `isAbsolute` is platform-dependent: `isAbsolute('C:/work/a.js')` returns
+`false` on Linux/macOS. The entry gate used it to filter write paths, so on those machines
+**every write was silently dropped**, signals A and C stopped working entirely, and a Windows
+dev machine stayed green. The fix is to stop asking the OS "does this root look like mine"
+and only ask "does it start at a root" (`isAbsPath`).
+
+`test/posix` uses a `node --import` resolve hook to swap `node:path` for `node:path/posix`
+and then **re-runs both suites unchanged** — so a Windows dev machine reproduces Linux path
+semantics. CI runs `npm run verify` on ubuntu / windows / macos × node 20 / 22, so this
+cannot quietly regress.
+
+Three more of the same family, all fixed in v0.2:
+
+| Symptom | Root cause | Now |
+| --- | --- | --- |
+| The gate never fires on Linux/macOS | `isAbsolute` is platform-dependent | `isAbsPath` accepts both dialects |
+| Panel shows four empty cards right after install | default `logFile: ""` wrote nothing | defaults to `$DSH_HOME/logs/better-debug.log` |
+| Plugin silently not loaded — no error, no log line | static `inject: ['skills']` makes `apply()` never run when the service is missing | `inject = []`, dynamic `ctx.inject` |
+| Clicking "enable" in the market does nothing | bundle patch carried a `config:` block | patch keeps only `id` + `name` |
+
+**Case folding is decided per platform** (`CASE_INSENSITIVE`): only on `win32` / `darwin`.
+The cost of folding wrong is asymmetric — not folding when you should under-reports, folding
+when you should not **over-reports** (crying wolf), and over-reporting is the one failure this
+gate must not make. A case-sensitive APFS volume on macOS under-reports a little, which is
+still the safe direction.
+
+`test/panel.mjs` covers **32 cases**: quoted and escaped field splitting; six line kinds (`inject` / `outcome` / `change` / `measure` / `arm` / `panel-failed`); zero drift between `charsFor` and the real text length across 6 signal combinations; `worstStreak` preserved along log→parse→aggregate→panel; `suppress` and `arm` lines parsed and not counted as fires; the aggregated `firstAction` / `turned` / `measures`; **assertions that v0.1's field names `changed` / `changedRate` / `outcomes` must not come back**; thresholds from the last `apply`; empty logs and bad lines not throwing; and an end-to-end run that really calls `apply()`, walks one turn, and reads the log back to assert `inject` carries `inj=`, `outcome` carries `before=write`, `measure ok=false exit=1`, and `change` is written and aggregated.
+
+## Known boundaries
+
+- "Same file" is decided by **absolute path**. Delete and recreate the same name and it still counts as the same place — usually correct (you are circling one concept), but if you keep rewriting generated files, exclude them via `excludePaths` or raise `repeatEditThreshold`.
+- **The measurement criterion is heuristic**: whether `ops_bash` runs a real measurement is guessed from a `measureCommands` / `measureIntent` regex pair. The cost of guessing wrong is now asymmetric — treating a non-measurement as a measurement under-reports, treating a measurement as a non-measurement over-reports. The default list leans toward "over-report rather than under-report", because acting on a false reminder costs you little.
+- `done-state` recognises a **successfully returned** `present` call, not "the model said a closing sentence". Plain-text final answers rely on the done-state self-check in the `stuck-gate` skill; if some task type never calls `present`, switch `doneOnPresent: false`.
+- Only **main sessions** are covered. In multi-agent runs each subagent can circle without being stopped — but their output flows to the lead, and the lead's counters still apply.
+- The panel is a **read-only log view**, not monitoring: it writes nothing and never changes gate decisions. Only when you explicitly set `logFile: ""` (no file) does it have nothing to show and report zeros.
+- `firstAction`'s denominator is "injections that were observed". An injection followed by the turn ending (no further `tool/call`) is not counted, so the ratio swings a lot on small samples — read the magnitude, don't treat it as a KPI.
 
 ## License
 
