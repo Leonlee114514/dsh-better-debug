@@ -175,13 +175,21 @@ The route is mounted via `ctx.inject(['webServer'], …)` — a **dynamic inject
 
 ## Install
 
-**Quick (Release tarball; pnpm treats it as a normal package):**
+**Shortest path (npm registry — published):**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.0/dsh-better-debug-0.2.0.tgz
+dsh plugin add dsh-better-debug
 ```
 
-(This package is **not** published to the npm registry, so `dsh plugin add dsh-better-debug` will 404. Use the tarball URL above, or link manually as below.)
+**Or from the Release tarball (pnpm treats it as a normal package):**
+
+```bash
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.1/dsh-better-debug-0.2.1.tgz
+```
+
+(Both install the same package: the npm tarball is byte-identical to the Release asset.
+Going through npm also lets the market's daily probe backfill the `npm` field into the
+catalog entry, so a click installs straight from the registry.)
 
 **Manual link (use this if you want to change the code):**
 
@@ -291,13 +299,13 @@ Not writing a file was the v0.1 default, and the cost was new users installing i
 
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
-node test/sim.mjs           # 37 cases: gate semantics + portability
+node test/sim.mjs           # 40 cases: gate semantics + portability
 node test/panel.mjs         # 32 cases: log parsing, aggregation, instrumentation
 npm run test:posix          # re-runs both suites under POSIX path semantics
 npm run verify              # all of the above (with syntax checks)
 ```
 
-`test/sim.mjs` uses a fake ctx that replicates agent-loop call order (`emitPlain` / `emitWaterfall`) and covers **37 cases**.
+`test/sim.mjs` uses a fake ctx that replicates agent-loop call order (`emitPlain` / `emitWaterfall`) and covers **40 cases**.
 
 Semantics (each with a positive and a negative):
 
@@ -324,10 +332,10 @@ and only ask "does it start at a root" (`isAbsPath`).
 
 `test/posix` uses a `node --import` resolve hook to swap `node:path` for `node:path/posix`
 and then **re-runs both suites unchanged** — so a Windows dev machine reproduces Linux path
-semantics. CI runs `npm run verify` on ubuntu / windows / macos × node 20 / 22, so this
-cannot quietly regress.
+semantics. CI runs `npm run verify` on ubuntu / windows / macos × node 20 / 22 / 24, so this
+cannot quietly regress. (24 is not padding: the desktop build runs Electron's bundled node 24.)
 
-Three more of the same family, all fixed in v0.2:
+Four more of the same family, all fixed in v0.2 / v0.2.1:
 
 | Symptom | Root cause | Now |
 | --- | --- | --- |
@@ -335,6 +343,7 @@ Three more of the same family, all fixed in v0.2:
 | Panel shows four empty cards right after install | default `logFile: ""` wrote nothing | defaults to `$DSH_HOME/logs/better-debug.log` |
 | Plugin silently not loaded — no error, no log line | static `inject: ['skills']` makes `apply()` never run when the service is missing | `inject = []`, dynamic `ctx.inject` |
 | Clicking "enable" in the market does nothing | bundle patch carried a `config:` block | patch keeps only `id` + `name` |
+| A too-old host is never rejected | the range lived in `dsh.engines.dsh`, but the host and the market read only top-level `engines.dsh` | moved to top-level `engines.dsh` |
 
 **Case folding is decided per platform** (`CASE_INSENSITIVE`): only on `win32` / `darwin`.
 The cost of folding wrong is asymmetric — not folding when you should under-reports, folding

@@ -813,6 +813,38 @@ check(
   )
 }
 
+// ── 28h. DSH 版本范围必须写在顶层 engines.dsh
+//
+// 这条守的是又一个「声明了但没人读」：
+//   · 宿主 @deepseek-ai/dsh-app-boot 的 unmetRequirements() 读的是
+//     `Object.hasOwn(fields,'engines') ? fields.engines.dsh : …`，
+//   · 市场的 dshmarket/lib/verify.js:252 读的也是 `manifest.engines?.dsh`，
+//   · 市场每日 probe 回填的 enginesDsh 也取自 manifest.engines.dsh。
+// 把范围写在 dsh.engines.dsh（读起来更"DSH 味道"）没有任何代码读它 —— 实测
+// evaluatePluginCompatibility({engines:{dsh:'>=9.0.0'}}) 会被拦下，而同样不满足的
+// 嵌套写法返回 undefined（视为满足）。后果不是崩溃，是宿主/市场永远不会因为
+// 版本太旧而拒装，装上去才在运行期炸。
+{
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const range = pkg.engines?.dsh
+  check(
+    'package.json 的 DSH 版本范围写在顶层 engines.dsh（宿主与市场只读这个位置）',
+    typeof range === 'string' && range.trim() !== '',
+    `engines.dsh=${JSON.stringify(range)}`
+  )
+  const dead = pkg.dsh?.engines?.dsh
+  check(
+    '没有残留的 dsh.engines.dsh 死声明（没有代码读这个位置）',
+    dead === undefined,
+    `dsh.engines.dsh=${JSON.stringify(dead)}`
+  )
+  check(
+    'engines.node 仍然声明（npm install 时要读）',
+    typeof pkg.engines?.node === 'string' && pkg.engines.node.trim() !== '',
+    `engines.node=${JSON.stringify(pkg.engines?.node)}`
+  )
+}
+
 // ── 29. 导出形状
 check('导出 name', name === 'dsh-better-debug', name)
 const failed = results.filter((r) => !r.pass)

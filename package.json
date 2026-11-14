@@ -1,6 +1,6 @@
 {
   "name": "dsh-better-debug",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "卡住闸门的代码化：同一文件连续盲改 / 同一操作重复报错 / 改完没有回路又动手，命中就在下一步注入一次提醒，逼出一条几秒能跑的反馈回路。",
   "type": "module",
   "main": "lib/index.js",
@@ -42,13 +42,11 @@
       "inject": [
         "slots"
       ]
-    },
-    "engines": {
-      "dsh": ">=0.2.1-rc.5"
     }
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.5"
   },
   "scripts": {
     "check": "node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js && node --check test/sim.mjs && node --check test/panel.mjs && node --check test/posix/register.mjs && node --check test/posix/hooks.mjs && node --check test/posix/path.mjs",
