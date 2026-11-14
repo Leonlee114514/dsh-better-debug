@@ -10,6 +10,30 @@ import { apply } from '../lib/index.js'
 import { aggregate, parseLine, parseLog, scanFields, estimateTokens, readAggregate } from '../lib/panel.js'
 import { charsFor, messageText } from '../lib/text.js'
 
+// record() 是 appendFile，插件里刻意不 await（不能因为写日志拖慢每一步）。
+// 所以「读回日志」必须等**条件**而不是等**时长**：固定 sleep 在慢盘上就是
+// 用测试去赌文件系统时序 —— 2026-11-14 的真机 CI（windows-latest + node 24）
+// 正是这样红的：inject/outcome/change 都写好了，measure 还在队列里，
+// 断言报「no measure line」，看起来像埋点坏了，其实只是读早了。
+// 这个助手每 10ms 读一次，直到目标行型齐了；超时则把**缺哪个**报出来，
+// 让失败信息指向真正的缺口，而不是一句无信息的 'no measure line'。
+async function readLogWhenReady(logFile, kinds, budgetMs = 5000) {
+  const startedAt = Date.now()
+  let text = ''
+  for (;;) {
+    try {
+      text = readFileSync(logFile, 'utf8')
+    } catch {
+      text = ''
+    }
+    const have = new Set(parseLog(text).map((record) => record.kind))
+    const missing = kinds.filter((kind) => !have.has(kind))
+    if (missing.length === 0) return { text, missing, waited: Date.now() - startedAt }
+    if (Date.now() - startedAt >= budgetMs) return { text, missing, waited: Date.now() - startedAt }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 const results = []
 function check(label, pass, detail) {
   results.push({ label, pass, detail })
@@ -260,14 +284,15 @@ function check(label, pass, detail) {
   })
   await ctx.emitPlain('session/event', session, { type: 'turn/end', data: { turn: 1 } })
 
-  // record() 是 appendFile，插件里刻意不 await（不能因为写日志拖慢每一步）。
-  // 所以读回之前得给文件系统一个落盘机会，否则测的是竞态而不是行为。
-  await new Promise((resolve) => setTimeout(resolve, 120))
-
-  let text = ''
-  try {
-    text = readFileSync(logFile, 'utf8')
-  } catch {}
+  // 等条件，不等时长（见文件顶部 readLogWhenReady 的注释）。
+  const ready = await readLogWhenReady(logFile, ['apply', 'inject', 'outcome', 'change', 'measure'])
+  const text = ready.text
+  if (ready.missing.length > 0) {
+    console.log(
+      `  [注意] 等了 ${ready.waited}ms 仍有行型没落盘：${ready.missing.join(', ')}` +
+        '（下面相关断言会照实失败，缺口在这里而不是在断言里）'
+    )
+  }
   const records = parseLog(text)
   const inject = records.find((r) => r.kind === 'inject')
   const outcome = records.find((r) => r.kind === 'outcome')
@@ -305,6 +330,18 @@ function check(label, pass, detail) {
       a.turned.total === 1 && a.turned.rate === 1 && a.measures.total === 1 && a.measures.failed === 1,
     `turned=${a.turned.total} measures=${a.measures.total}`
   )
+
+  // 慢盘那一轮（test:slow）要能证明「这条防线真在位」：如果 resolve hook 没生效，
+  // 插件拿到的是真 appendFile，计数器为 0，于是「等条件」有没有生效根本无从判断。
+  // 普通轮里这个 symbol 不存在 → 记为「不适用」，不冒充通过。
+  const slow = globalThis[Symbol.for('better-debug.test.slow')]
+  if (slow !== void 0) {
+    check(
+      '慢盘轮：appendFile 替身确实被插件用到（不是在测空气）',
+      slow.count > 0,
+      `slowAppends=${slow.count} delay=${slow.delay}ms`
+    )
+  }
 
   try {
     rmSync(logFile, { force: true })

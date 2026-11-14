@@ -184,7 +184,7 @@ dsh plugin add dsh-better-debug
 **Or from the Release tarball (pnpm treats it as a normal package):**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.4/dsh-better-debug-0.2.4.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.5/dsh-better-debug-0.2.5.tgz
 ```
 
 (Both install the same package: the npm tarball is byte-identical to the Release asset.
@@ -300,9 +300,10 @@ Not writing a file was the v0.1 default, and the cost was new users installing i
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
 node test/sim.mjs           # 46 cases: gate semantics + portability
-node test/panel.mjs         # 40 cases: log parsing, aggregation, generation scoping, instrumentation
+node test/panel.mjs         # 40 cases: log parsing, aggregation, generation scoping, instrumentation (41 under test:slow)
 npm run test:posix          # re-runs both suites under POSIX path semantics
 npm run test:linux          # re-runs both suites under Linux platform semantics (no case folding)
+npm run test:slow           # slows log writes to 400ms, proving reads wait on a condition, not a duration
 npm run verify              # all of the above (with syntax checks)
 ```
 
@@ -351,7 +352,28 @@ Windows dev machine and CI supplies the fourth. The assertions no longer hard-co
 `samePath` / `sameDirs` compare per platform, and expectations are written in their **original
 case** (`C:/Users/u/...`, `/home/u/projB`).
 
-The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2 / v0.2.3:
+### Why there is a `test:slow` pass
+
+The third kind of "green here, red on a real machine" is not platform semantics but **timing**.
+The plugin writes log lines with `void record(...)` — deliberately not awaited, because one log
+line must not slow the agent down. The price is that "has it been written yet" is always a race
+when a test reads the log back.
+
+Real CI (`windows-latest` + node 24) went red exactly that way on 2026-11-14: the `inject`,
+`outcome` and `change` lines had landed, `measure` was still queued, and the assertion reported
+`no measure line` — which looks like broken instrumentation but is just an **early read**. The fix
+is not raising `sleep` from 120ms to 500ms (that only rolls the dice again) but replacing "wait a
+duration" with "wait for a condition": `readLogWhenReady()` re-reads every 10ms until the wanted
+line kinds exist, and on timeout prints **which lines are missing**, so the failure points at the
+real gap.
+
+`test/slow` makes that timing deterministic: a `registerHooks` resolver swaps
+`node:fs/promises` for a stand-in whose `appendFile` is 400ms slower (`BD_SLOW_MS` adjustable).
+Any "wait a fixed duration" read goes red every time; a "wait for the condition" read stays green
+no matter how slow. It is a regression guard, not a benchmark. On `node < 22.15` there is no
+`registerHooks`, so this pass skips itself — the same two-channel strategy as `test:posix`.
+
+The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2 / v0.2.3 / v0.2.4 / v0.2.5:
 
 | Symptom | Root cause | Now |
 | --- | --- | --- |
@@ -365,6 +387,7 @@ The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2 / v0.2.3:
 | Running tests in a sibling directory washed out this directory's blind-edit count | `measureDirs` treated `cd <dir>` as a file and took its parent (`cd ~/projB` → `~`) | `cd` is recognised; that segment is a directory |
 | The panel kept showing "the plugin is currently disabled" while it was clearly running | the banner counted `disabled` / `panel failed` over the **whole log**, so one historical failure counted as "broken now" forever | the banner only reads the generation after the last `apply` (`log.current`); history is reported separately in the footer |
 | New assertions were green on Windows and red on real Linux CI | they hard-coded the `CASE_INSENSITIVE` fold result; `test:posix` swaps `node:path` but not `platform`, so that branch never ran here | the `test:linux` pass overrides `process.platform`, and assertions compare through `samePath` per platform |
+| The same suite is 40/40 here and 38/40 on `windows-latest` + node 24 | the test used a fixed `sleep` to wait for log writes; the plugin deliberately does `void record(...)` without awaiting, so on a slow disk `measure` was read before it landed | log reads now wait on a condition (`readLogWhenReady`), and `test:slow` slows writes by 400ms as a regression guard |
 
 **Case folding is decided per platform** (`CASE_INSENSITIVE`): only on `win32` / `darwin`.
 The cost of folding wrong is asymmetric — not folding when you should under-reports, folding
@@ -372,7 +395,7 @@ when you should not **over-reports** (crying wolf), and over-reporting is the on
 gate must not make. A case-sensitive APFS volume on macOS under-reports a little, which is
 still the safe direction.
 
-`test/panel.mjs` covers **40 cases**: quoted and escaped field splitting; six line kinds (`inject` / `outcome` / `change` / `measure` / `arm` / `panel-failed`); zero drift between `charsFor` and the real text length across 6 signal combinations; `worstStreak` preserved along log→parse→aggregate→panel; `suppress` and `arm` lines parsed and not counted as fires; the aggregated `firstAction` / `turned` / `measures`; **assertions that v0.1's field names `changed` / `changedRate` / `outcomes` must not come back**; thresholds from the last `apply`; empty logs and bad lines not throwing; and an end-to-end run that really calls `apply()`, walks one turn, and reads the log back to assert `inject` carries `inj=`, `outcome` carries `before=write`, `measure ok=false exit=1`, and `change` is written and aggregated. Generation scoping has its own group: failures in the history with a clean generation after the last `apply` must leave `log.current` at zero and keep the banner quiet; a failure *after* the last `apply` must light it; a log with no `apply` line at all gives `markers=0`, and the panel says it only has a fragment rather than claiming health. **The page itself is asserted too** — the test reads `web/index.html` and checks the banner consumes `log.current` and no whole-log branch survived.
+`test/panel.mjs` covers **40 cases** (41 under `test:slow`; the extra one asserts the slow shim is actually in use, so that pass can never be testing nothing): quoted and escaped field splitting; six line kinds (`inject` / `outcome` / `change` / `measure` / `arm` / `panel-failed`); zero drift between `charsFor` and the real text length across 6 signal combinations; `worstStreak` preserved along log→parse→aggregate→panel; `suppress` and `arm` lines parsed and not counted as fires; the aggregated `firstAction` / `turned` / `measures`; **assertions that v0.1's field names `changed` / `changedRate` / `outcomes` must not come back**; thresholds from the last `apply`; empty logs and bad lines not throwing; and an end-to-end run that really calls `apply()`, walks one turn, and reads the log back to assert `inject` carries `inj=`, `outcome` carries `before=write`, `measure ok=false exit=1`, and `change` is written and aggregated. Generation scoping has its own group: failures in the history with a clean generation after the last `apply` must leave `log.current` at zero and keep the banner quiet; a failure *after* the last `apply` must light it; a log with no `apply` line at all gives `markers=0`, and the panel says it only has a fragment rather than claiming health. **The page itself is asserted too** — the test reads `web/index.html` and checks the banner consumes `log.current` and no whole-log branch survived.
 
 ## Known boundaries
 

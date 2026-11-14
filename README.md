@@ -222,7 +222,7 @@ dsh plugin add dsh-better-debug
 **或者从 Release tarball 装（pnpm 会把它当普通包装进 profile）：**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.4/dsh-better-debug-0.2.4.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.5/dsh-better-debug-0.2.5.tgz
 ```
 
 （两条装的是同一个包：npm 上的 tarball 与 Release 资产逐字节相同。走 npm 的好处是
@@ -364,9 +364,10 @@ bundle 层按原样加载」。也就是说：**写了 config，用户点「启�
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
 node test/sim.mjs           # 46 个用例：闸门语义 + 可移植性
-node test/panel.mjs         # 40 个用例：日志解析、聚合、世代判定、埋点落盘
+node test/panel.mjs         # 40 个用例：日志解析、聚合、世代判定、埋点落盘（慢盘轮多 1 条自检，41）
 npm run test:posix          # 把上面两套用 POSIX 路径语义再跑一遍
 npm run test:linux          # 再把上面两套用 Linux 平台语义（不折叠大小写）跑一遍
+npm run test:slow           # 把落盘拖慢 400ms，验证「等条件读日志」而不是等时长
 npm run verify              # 上面全部（含语法检查）
 ```
 
@@ -415,7 +416,24 @@ ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以�
 Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是用 `samePath` / `sameDirs`
 按平台比较，期望值用**原始大小写**书写（`C:/Users/u/...`、`/home/u/projB`）。
 
-同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 修掉了：
+### 为什么有 `test:slow` 这一轮
+
+第三类「本机绿、真机红」不是平台语义，是**时序**。插件写日志用的是
+`void record(...)`——刻意不 `await`，因为不能因为写一行日志就拖慢 agent 每一步。
+代价是：测试读回日志时，「写完了没有」永远是个竞态。
+
+2026-11-14 的真机 CI（`windows-latest` + node 24）正是这样红的：`inject` / `outcome` /
+`change` 三行都落盘了，`measure` 还在队列里，断言报 `no measure line`——看起来像埋点坏了，
+其实只是**读早了**。修法不是把 `sleep` 从 120ms 加到 500ms（那只是把骰子换个面），
+而是把「等时长」换成「等条件」：`readLogWhenReady()` 每 10ms 读一次，直到目标行型齐全，
+超时则把**缺哪一行**打印出来，让失败信息指向真正的缺口。
+
+`test/slow` 把那个时序放大到必然发生：`registerHooks` 把 `node:fs/promises` 换成
+`appendFile` 慢 400ms 的替身（`BD_SLOW_MS` 可调）。于是任何「等固定时长」的写法都会
+稳定红，而「等条件」的写法不管慢多少都绿。这是回归防线，不是性能测试。
+`node < 22.15` 没有 `registerHooks`，这一轮自动跳过——与 `test:posix` 的两通道策略一致。
+
+同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 / v0.2.4 / v0.2.5 修掉了：
 
 | 症状 | 根因 | 现在 |
 | --- | --- | --- |
@@ -429,12 +447,13 @@ Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是�
 | 在兄弟目录跑测试，把这个目录的盲改计数洗白了 | `measureDirs` 把 `cd <dir>` 当文件取父目录（`cd ~/projB` → `~`） | 认 `cd` 形式，那段路径按目录处理 |
 | 面板永远红着脸说「插件当前被关闭」，而它明明在跑 | 横幅数的是**整份日志**里的 `disabled` / `panel failed`，历史里挂过一次就永久算「现在坏了」 | 横幅只认最后一次 `apply` 之后（`log.current`），历史单独的个数写在页脚 |
 | 新加的用例在 Windows 上全绿，真机 Linux CI 全红 | 断言把 `CASE_INSENSITIVE` 的折叠结果写死了；`test:posix` 只换 `node:path`、不伪造 `platform`，那条分支本机永不执行 | `test:linux` 轮覆盖 `process.platform`，断言改用 `samePath` 按平台比 |
+| 同一份用例在本机 40/40，`windows-latest` + node 24 上 38/40 | 测试用固定 `sleep` 等日志落盘；插件刻意 `void record(...)` 不 `await`，慢盘上 `measure` 行还没写完就读了 | 读日志改成等条件（`readLogWhenReady`），并新增 `test:slow` 把落盘拖慢 400ms 当回归防线 |
 
 **大小写折叠按平台判**（`CASE_INSENSITIVE`）：只在 `win32` / `darwin` 上折叠。折叠错了的
 后果不对称——该折叠却不折叠是漏报，不该折叠却折叠是**误报**（狼来了），后者才是这道闸门
 最不能犯的错。macOS 上装了区分大小写的 APFS 会少报一点，仍然是安全方向。
 
-`test/panel.mjs` 覆盖 **40 个用例**：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
+`test/panel.mjs` 覆盖 **40 个用例**（慢盘轮 41 条：多的是那条「替身确实被用到」的自检——hook 没生效时它会红，避免整轮在测空气）：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
 `change` / `measure` / `arm` / `panel-failed`）、`charsFor` 与真实文案长度零漂移（6 组信号组合）、
 `worstStreak` 在日志→解析→聚合→面板全链路保留、`suppress` 与 `arm` 行可解析且不计入触发、
 聚合出的 `firstAction` / `turned` / `measures`、**断言 v0.1 的旧字段名
