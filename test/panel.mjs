@@ -363,6 +363,79 @@ function check(label, pass, detail) {
   const text = '2026-11-11T00:00:00.000Z panel register failed: duplicate prefix route'
   const a = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length })
   check('panel register failed 被计入', a.log.panelFailed === 1, `panelFailed=${a.log.panelFailed}`)
+  // 没有 apply 行也没有 disabled 行 = 日志里没有世代分界（残缺片段）。
+  // 失败照实计入，但要标记 markers=0，面板据此说「无法判断当前世代」，
+  // 而不是冒充「现在健康」——也不冒充「现在坏了」。
+  check(
+    '没有世代分界时 markers=0，面板不冒充判断',
+    a.log.current.panelFailed === 1 && a.log.current.markers === 0 && a.log.current.since === '',
+    `current=${JSON.stringify(a.log.current)}`
+  )
+}
+
+// ── 11b. 世代分界：历史里挂过，最后一次 apply 之后是干净的 → 横幅不该亮
+{
+  const text = [
+    '2026-11-07T04:34:36.011Z panel register failed: cannot get property "webServer" without inject',
+    '2026-11-07T05:00:36.666Z panel register failed: webserver: duplicate prefix route "/better-debug"',
+    '2026-11-07T05:01:51.152Z panel register failed: webserver: duplicate prefix route "/better-debug"',
+    '2026-11-14T00:44:41.005Z disabled by config, no gate installed',
+    '2026-11-14T11:23:07.155Z apply pid=5596 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true'
+  ].join('\n')
+  const a = aggregate(parseLog(text), { logFile: 'C:/x.log', exists: true, bytes: text.length })
+  check(
+    '历史上的失败不染红当前世代（全量仍留着）',
+    a.log.disabled === 1 && a.log.panelFailed === 3 &&
+      a.log.current.disabled === 0 && a.log.current.panelFailed === 0 &&
+      a.log.current.scoped === undefined && a.log.current.markers === 2 &&
+      a.log.current.since === '2026-11-14T11:23:07.155Z',
+    `total=${a.log.disabled}/${a.log.panelFailed} current=${JSON.stringify(a.log.current)}`
+  )
+}
+
+// ── 11c. 世代之内仍有失败 → current 必须亮（否则就是「修好了」的假绿）
+{
+  const text = [
+    '2026-11-14T11:23:07.155Z apply pid=5596 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true',
+    '2026-11-14T11:23:09.000Z panel register failed: duplicate prefix route "/better-debug"',
+    '2026-11-14T11:23:10.000Z skill register failed: duplicate skill name'
+  ].join('\n')
+  const a = aggregate(parseLog(text), { logFile: 'C:/x.log', exists: true, bytes: text.length })
+  check(
+    '当前世代内的失败会被计入 current',
+    a.log.current.panelFailed === 1 && a.log.current.skillFailed === 1 && a.log.current.disabled === 0,
+    `current=${JSON.stringify(a.log.current)}`
+  )
+}
+
+// ── 11d. 页面本身必须真的按世代判断（否则后端算对了、界面还在报旧账）
+// 后端修好而 HTML 仍读 lg.disabled 的回归，测试必须能抓住 —— 所以直接读页面源码断言。
+{
+  const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8')
+  const usesCurrent = html.includes('lg.current') && html.includes('curDisabled')
+  const noOldBranch = !/if\s*\(\s*lg\.disabled\s*\)/.test(html) && !/else if\s*\(\s*lg\.panelFailed\s*\)/.test(html)
+  const hasStaleApiNote = html.includes('lg.current === undefined') && html.includes('这个页面比插件新')
+  const hasNoBoundaryNote = html.includes('认不出是哪一次加载之后的记录')
+  let scriptParses = false
+  const inline = html.match(/<script>([\s\S]*)<\/script>/)
+  if (inline !== null) {
+    try {
+      // 只做语法解析，不执行：避免页面脚本碰 document。
+      new Function(inline[1])
+      scriptParses = true
+    } catch (error) {
+      scriptParses = `${error?.message ?? error}`
+    }
+  }
+  check('页面横幅读 log.current 而不是全量计数', usesCurrent, `usesCurrent=${usesCurrent}`)
+  check('页面没有残留「按全量计数判红」的老分支', noOldBranch, `noOldBranch=${noOldBranch}`)
+  check(
+    '老 API（无 current 段）不静默变成绿灯，而是退回全量口径并说明',
+    hasStaleApiNote,
+    `hasStaleApiNote=${hasStaleApiNote}`
+  )
+  check('日志没有 apply 行时页面明说「不能当作现在健康」', hasNoBoundaryNote, `note=${hasNoBoundaryNote}`)
+  check('内联脚本能被解析（不执行）', scriptParses === true, `parses=${scriptParses}`)
 }
 
 const failed = results.filter((r) => !r.pass)

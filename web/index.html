@@ -154,6 +154,7 @@
 
   <div class="foot">
     <p><b>每个数字都能逐行数出来。</b>触发次数、覆盖会话、信号分布来自 <code>inject</code> 行；「提示后首个动作」来自紧接着的那条 <code>outcome</code> 行；窗口内转向来自 <code>change</code> 行；测量回路来自 <code>measure</code> 行（它是「有没有反馈回路」的直接证据，跟任何动作分类无关）。<span id="suppressed-note"></span></p>
+    <p><b>顶部那条红条只说「现在」。</b>它只数最后一次 <code>apply</code>（也就是最近一次加载）之后的失败行——那之前的关闭/挂载失败已经被这次加载取代，不代表当下状态，只在这里列个数。<span id="hist-note"></span></p>
     <p><b>这些数字不证明什么。</b>「提示后首个动作」只说明提示之后模型做了什么，它不能证明提示促成了这个动作，更不能证明它发现了缺陷——要回答那个问题需要对照组或历史回放。面板也不估算「省掉了多少 token」：那要先假设模型本来会失败，属于编数。</p>
   </div>
 
@@ -307,16 +308,52 @@
       }).join('')
     }
 
-    if (lg.disabled) {
-      $('error').hidden = false
-      $('error').textContent = '日志里有 ' + lg.disabled + ' 条 disabled by config —— 插件当前被关闭。'
-    } else if (lg.skillFailed) {
-      $('error').hidden = false
-      $('error').textContent = '自带技能注册失败 ' + lg.skillFailed + ' 次，闸门本身不受影响。'
-    } else if (lg.panelFailed) {
-      $('error').hidden = false
-      $('error').textContent = '面板路由挂载失败 ' + lg.panelFailed + ' 次 —— 闸门可能仍在工作，但读数面板没挂上。'
+    // 横幅只说「现在」：只数最后一次 apply 之后发生的失败。
+    // 历史里挂过一次、修好之后仍永久染红，会让面板说「插件当前被关闭」
+    // 而它明明在跑 —— 那比没有面板更坏。全量计数仍留在 log.disabled 等字段，
+    // 并在页脚如实写成「历史日志里记过」。
+    var cur = lg.current || {}
+    var curDisabled = Number(cur.disabled) || 0
+    var curSkillFailed = Number(cur.skillFailed) || 0
+    var curPanelFailed = Number(cur.panelFailed) || 0
+    var sincePrefix = cur.since ? '最后一次加载（' + esc(cur.since) + '）之后，' : ''
+    // 老 API（没有 current 段）只能退回全量口径：宁可多报，也不把真实故障咽下去。
+    if (lg.current === undefined || lg.current === null) {
+      curDisabled = Number(lg.disabled) || 0
+      curSkillFailed = Number(lg.skillFailed) || 0
+      curPanelFailed = Number(lg.panelFailed) || 0
+      sincePrefix = '日志里有 '
     }
+
+    if (curDisabled) {
+      $('error').hidden = false
+      $('error').textContent = sincePrefix + '记了 ' + curDisabled + ' 条 disabled by config —— 插件当前被关闭。'
+    } else if (curSkillFailed) {
+      $('error').hidden = false
+      $('error').textContent = sincePrefix + '记了 ' + curSkillFailed + ' 次技能注册失败，闸门本身不受影响。'
+    } else if (curPanelFailed) {
+      $('error').hidden = false
+      $('error').textContent = sincePrefix + '记了 ' + curPanelFailed + ' 次面板路由挂载失败 —— 闸门可能仍在工作，但读数面板没挂上。'
+    }
+
+    // 历史归历史：不染红，但要如实说明它存在，否则「0」会被读成「从来没出过事」。
+    var stale = (Number(lg.disabled) || 0) - curDisabled +
+      (Number(lg.skillFailed) || 0) - curSkillFailed +
+      (Number(lg.panelFailed) || 0) - curPanelFailed
+    var notes = []
+    if (stale > 0) {
+      notes.push('另外，历史日志里还记着 ' + stale + ' 条更早的关闭 / 挂载失败（都在最后一次加载之前），已被当前这次加载取代；它们不代表现在的状态。')
+    }
+    // markers=0：日志里既没有 apply 也没有 disabled，读到的只是一段片段。
+    // 这时候「没有红条」不等于「现在健康」，得说出来，不能默认绿灯。
+    if (lg.current === undefined || lg.current === null) {
+      // 页面是每次请求现读的，插件模块不是。改完代码但还没重启时，
+      // 新页面会拿到旧 API（没有 current 段）—— 说出来，别让它看起来像健康。
+      notes.push('这个页面比插件新：API 还没有 <code>log.current</code> 段（插件需要重载才会用上新代码）。上面的红条按老口径判断，可能误报。')
+    } else if ((Number(cur.markers) || 0) === 0) {
+      notes.push('这份日志里没有 <code>apply</code> 行，认不出是哪一次加载之后的记录 —— 上面这些数字只是读到的片段，不能当作「现在健康」。')
+    }
+    $('hist-note').innerHTML = notes.length > 0 ? ' ' + notes.join(' ') : ''
   }
 
   function fail(message) {

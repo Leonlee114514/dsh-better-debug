@@ -184,7 +184,7 @@ dsh plugin add dsh-better-debug
 **Or from the Release tarball (pnpm treats it as a normal package):**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.2/dsh-better-debug-0.2.2.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.3/dsh-better-debug-0.2.3.tgz
 ```
 
 (Both install the same package: the npm tarball is byte-identical to the Release asset.
@@ -300,7 +300,7 @@ Not writing a file was the v0.1 default, and the cost was new users installing i
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
 node test/sim.mjs           # 46 cases: gate semantics + portability
-node test/panel.mjs         # 32 cases: log parsing, aggregation, instrumentation
+node test/panel.mjs         # 40 cases: log parsing, aggregation, generation scoping, instrumentation
 npm run test:posix          # re-runs both suites under POSIX path semantics
 npm run verify              # all of the above (with syntax checks)
 ```
@@ -335,7 +335,7 @@ and then **re-runs both suites unchanged** — so a Windows dev machine reproduc
 semantics. CI runs `npm run verify` on ubuntu / windows / macos × node 20 / 22 / 24, so this
 cannot quietly regress. (24 is not padding: the desktop build runs Electron's bundled node 24.)
 
-The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2:
+The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2 / v0.2.3:
 
 | Symptom | Root cause | Now |
 | --- | --- | --- |
@@ -347,6 +347,7 @@ The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2:
 | In a real project every error is reported as "the same operation failed again" | node's stack is `file:///C:/...`, and the path regex hits the `e:` inside the scheme, so every stack becomes `"e:///c"` | `stripFileUrl` removes the URL head first |
 | `a1.js` and `a2.js` are treated as the same place | normalisation replaced every digit in the path with `<n>`; only line/column should go | only the trailing `(:\d+)+$` is stripped |
 | Running tests in a sibling directory washed out this directory's blind-edit count | `measureDirs` treated `cd <dir>` as a file and took its parent (`cd ~/projB` → `~`) | `cd` is recognised; that segment is a directory |
+| The panel kept showing "the plugin is currently disabled" while it was clearly running | the banner counted `disabled` / `panel failed` over the **whole log**, so one historical failure counted as "broken now" forever | the banner only reads the generation after the last `apply` (`log.current`); history is reported separately in the footer |
 
 **Case folding is decided per platform** (`CASE_INSENSITIVE`): only on `win32` / `darwin`.
 The cost of folding wrong is asymmetric — not folding when you should under-reports, folding
@@ -354,7 +355,7 @@ when you should not **over-reports** (crying wolf), and over-reporting is the on
 gate must not make. A case-sensitive APFS volume on macOS under-reports a little, which is
 still the safe direction.
 
-`test/panel.mjs` covers **32 cases**: quoted and escaped field splitting; six line kinds (`inject` / `outcome` / `change` / `measure` / `arm` / `panel-failed`); zero drift between `charsFor` and the real text length across 6 signal combinations; `worstStreak` preserved along log→parse→aggregate→panel; `suppress` and `arm` lines parsed and not counted as fires; the aggregated `firstAction` / `turned` / `measures`; **assertions that v0.1's field names `changed` / `changedRate` / `outcomes` must not come back**; thresholds from the last `apply`; empty logs and bad lines not throwing; and an end-to-end run that really calls `apply()`, walks one turn, and reads the log back to assert `inject` carries `inj=`, `outcome` carries `before=write`, `measure ok=false exit=1`, and `change` is written and aggregated.
+`test/panel.mjs` covers **40 cases**: quoted and escaped field splitting; six line kinds (`inject` / `outcome` / `change` / `measure` / `arm` / `panel-failed`); zero drift between `charsFor` and the real text length across 6 signal combinations; `worstStreak` preserved along log→parse→aggregate→panel; `suppress` and `arm` lines parsed and not counted as fires; the aggregated `firstAction` / `turned` / `measures`; **assertions that v0.1's field names `changed` / `changedRate` / `outcomes` must not come back**; thresholds from the last `apply`; empty logs and bad lines not throwing; and an end-to-end run that really calls `apply()`, walks one turn, and reads the log back to assert `inject` carries `inj=`, `outcome` carries `before=write`, `measure ok=false exit=1`, and `change` is written and aggregated. Generation scoping has its own group: failures in the history with a clean generation after the last `apply` must leave `log.current` at zero and keep the banner quiet; a failure *after* the last `apply` must light it; a log with no `apply` line at all gives `markers=0`, and the panel says it only has a fragment rather than claiming health. **The page itself is asserted too** — the test reads `web/index.html` and checks the banner consumes `log.current` and no whole-log branch survived.
 
 ## Known boundaries
 

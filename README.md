@@ -222,7 +222,7 @@ dsh plugin add dsh-better-debug
 **或者从 Release tarball 装（pnpm 会把它当普通包装进 profile）：**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.2/dsh-better-debug-0.2.2.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.3/dsh-better-debug-0.2.3.tgz
 ```
 
 （两条装的是同一个包：npm 上的 tarball 与 Release 资产逐字节相同。走 npm 的好处是
@@ -364,7 +364,7 @@ bundle 层按原样加载」。也就是说：**写了 config，用户点「启�
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
 node test/sim.mjs           # 46 个用例：闸门语义 + 可移植性
-node test/panel.mjs         # 32 个用例：日志解析、聚合、埋点落盘
+node test/panel.mjs         # 40 个用例：日志解析、聚合、世代判定、埋点落盘
 npm run test:posix          # 把上面两套用 POSIX 路径语义再跑一遍
 npm run verify              # 上面全部（含语法检查）
 ```
@@ -402,7 +402,7 @@ npm run verify              # 上面全部（含语法检查）
 ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以这条不会退回去。
 （24 不是凑数：桌面版 DSH 跑的是 Electron 内置的 node 24。）
 
-同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 修掉了：
+同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 修掉了：
 
 | 症状 | 根因 | 现在 |
 | --- | --- | --- |
@@ -414,18 +414,24 @@ ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以�
 | 新项目里一报错就误报「同一个操作重复报错」 | node 的栈是 `file:///C:/...`，路径正则先撞上 scheme 里的 `e:`，每份栈都变成 `"e:///c"` | `stripFileUrl` 先剥 URL 头 |
 | `a1.js` 与 `a2.js` 被当成同一处 | 归一化把路径里每个数字都换成 `<n>`，只该剥行号列号 | 只剥末尾 `(:\d+)+$` |
 | 在兄弟目录跑测试，把这个目录的盲改计数洗白了 | `measureDirs` 把 `cd <dir>` 当文件取父目录（`cd ~/projB` → `~`） | 认 `cd` 形式，那段路径按目录处理 |
+| 面板永远红着脸说「插件当前被关闭」，而它明明在跑 | 横幅数的是**整份日志**里的 `disabled` / `panel failed`，历史里挂过一次就永久算「现在坏了」 | 横幅只认最后一次 `apply` 之后（`log.current`），历史单独的个数写在页脚 |
 
 **大小写折叠按平台判**（`CASE_INSENSITIVE`）：只在 `win32` / `darwin` 上折叠。折叠错了的
 后果不对称——该折叠却不折叠是漏报，不该折叠却折叠是**误报**（狼来了），后者才是这道闸门
 最不能犯的错。macOS 上装了区分大小写的 APFS 会少报一点，仍然是安全方向。
 
-`test/panel.mjs` 覆盖 **32 个用例**：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
+`test/panel.mjs` 覆盖 **40 个用例**：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
 `change` / `measure` / `arm` / `panel-failed`）、`charsFor` 与真实文案长度零漂移（6 组信号组合）、
 `worstStreak` 在日志→解析→聚合→面板全链路保留、`suppress` 与 `arm` 行可解析且不计入触发、
 聚合出的 `firstAction` / `turned` / `measures`、**断言 v0.1 的旧字段名
 `changed` / `changedRate` / `outcomes` 不得复活**、阈值取最后一条 `apply`、空日志与坏行不抛，
 以及端到端——真跑 `apply()` 走完一个 turn，读回日志断言 `inject` 带 `inj=`、
 `outcome` 带 `before=write`、`measure ok=false exit=1`、`change` 行都写了且被聚合。
+
+世代判定单列一组：历史里有失败、最后一次 `apply` 之后干净 → `log.current` 全 0、横幅不亮；
+`apply` 之后又失败 → `log.current` 必须亮；日志里根本没有 `apply` 行 → `markers=0`，
+面板明说「读到的只是片段」，不冒充健康。**页面本身也被断言**——直接读 `web/index.html`，
+确认横幅读的是 `log.current`、没有残留按全量计数判红的老分支。
 
 ## 已知边界
 
