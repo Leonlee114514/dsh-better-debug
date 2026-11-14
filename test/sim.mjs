@@ -11,6 +11,8 @@ import {
   inject,
   classifyTool,
   isMeasurement,
+  measureDirs,
+  errorFingerprint,
   errorTargetOf,
   exitCodeOf,
   isAbsPath,
@@ -843,6 +845,128 @@ check(
     typeof pkg.engines?.node === 'string' && pkg.engines.node.trim() !== '',
     `engines.node=${JSON.stringify(pkg.engines?.node)}`
   )
+}
+
+// ── 28i. 真实 ESM 栈是 file:/// URL，不能把所有栈塌成一个 episode
+//
+// 这条守的是「在 Windows 开发机上写、到真项目里就误报」的形态：node 抛异常时栈里
+// 写的是 `file:///C:/Users/.../a.mjs:12:29`，而路径正则先撞上 scheme 里的 `e:`，
+// 于是目标被认成 `"e:///c"` —— 三个不同文件的报错全塌成同一个 episode，B 信号对
+// 任何「不同文件各错一次」都误报。同一个正则还把路径里的数字归一（`a1.js` 与
+// `a2.js` 变成同一个），那是另一种塌陷。
+{
+  const alphaStack =
+    "TypeError: Cannot read properties of undefined (reading 'x')\n" +
+    '    at parse (file:///C:/Users/u/proj/alpha/lib/parse.mjs:12:29)\n' +
+    '    at file:///C:/Users/u/proj/alpha/index.mjs:2:1'
+  const betaStack = alphaStack.replace(/alpha/g, 'beta').replace('parse.mjs', 'other.mjs')
+  const posixStack =
+    "TypeError: boom\n    at f (file:///home/u/proj/alpha/lib/parse.mjs:9:11)"
+
+  const cases = [
+    [errorTargetOf(alphaStack) === 'c:/users/u/proj/alpha/lib/parse.mjs', `windows 栈取出真路径（得到 ${errorTargetOf(alphaStack)}）`],
+    [errorTargetOf(alphaStack) !== errorTargetOf(betaStack), '两个不同文件不是同一个目标'],
+    [errorTargetOf(posixStack) === '/home/u/proj/alpha/lib/parse.mjs', `posix 栈取出真路径（得到 ${errorTargetOf(posixStack)}）`],
+    [
+      errorTargetOf("ENOENT: open 'C:/work/src/a1.js'") !== errorTargetOf("ENOENT: open 'C:/work/src/a2.js'"),
+      '路径里的数字不归一（a1.js ≠ a2.js）'
+    ],
+    [
+      errorTargetOf("ENOENT: open 'C:/work/proj1/a.js'") !== errorTargetOf("ENOENT: open 'C:/work/proj2/a.js'"),
+      '目录名里的数字不归一（proj1 ≠ proj2）'
+    ],
+    [errorTargetOf('file:///C:/a/b.mjs:12:29') === 'c:/a/b.mjs', '行号列号仍然剥掉'],
+    [
+      errorTargetOf('file:///C:/a/b.mjs:12:29') === errorTargetOf('file:///C:/a/b.mjs:99:3'),
+      '同一文件不同行号仍是同一目标'
+    ]
+  ]
+  const bad = cases.filter(([pass]) => !pass).map(([, label]) => label)
+  check('file:/// 栈与路径内数字（目标识别）', bad.length === 0, bad.length === 0 ? `${cases.length} 项` : bad.join(', '))
+
+  // 指纹同样要认 file:///，否则行号抖动之下指纹全是同一个
+  const fpAlpha = errorFingerprint(alphaStack)
+  const fpAlphaAgain = errorFingerprint(alphaStack.replace(':12:29', ':77:4'))
+  check('file:/// 栈的指纹稳定（同文件不同行号同指纹）', fpAlpha === fpAlphaAgain, `${fpAlpha} / ${fpAlphaAgain}`)
+}
+
+// ── 28j. 端到端：两个不同文件的报错不得触发 B
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const stack = (dir) =>
+    "TypeError: Cannot read properties of undefined (reading 'x')\n" +
+    `    at parse (file:///C:/Users/u/projects/${dir}/lib/parse.mjs:12:29)`
+  const steps = [
+    [(s, c) => fail('c1', stack('alpha'))(s, c)],
+    [(s, c) => fail('c2', stack('beta'))(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('B: 两个不同文件的真实栈不触发（不能塌成一个 episode）', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 28j-2. 端到端：同一个文件的同一个报错吃两次，B 必须响
+//
+// 与 28j 成对：上面证明「不塌」，这条证明「没被顺手关掉」。只做前者的话，
+// 把 B 整个禁掉也能绿。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const stack =
+    "TypeError: Cannot read properties of undefined (reading 'x')\n" +
+    '    at parse (file:///C:/Users/u/projects/alpha/lib/parse.mjs:12:29)'
+  const steps = [
+    [(s, c) => fail('d1', stack)(s, c)],
+    [(s, c) => fail('d2', stack.replace(':12:29', ':12:31'))(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check(
+    'B: 同一文件同一报错两次仍然触发',
+    injected.length === 1 && Boolean(has(injected, '同一个操作重复报错')),
+    `injections=${injected.length}`
+  )
+}
+
+// ── 28k. 测量的管辖范围必须认 `cd <dir> && …` 这种真实写法
+//
+// 这条守的是一个真事故：`measureDirs` 把命令里抓到的路径一律当**文件**取父目录，
+// 于是 `cd /home/u/projB && npm test` 被剥成 `/home/u` —— 它是 projA 的祖先，
+// 一次兄弟目录的测试就把 projA 的盲改计数洗白了。而所有用例都只写 `workdir`，
+// 从来没写过 `cd` 形式，所以这条一直没被测到。
+{
+  const cases = [
+    [[...measureDirs({ command: 'cd /home/u/projB && npm test' })], ['/home/u/projb'], 'POSIX cd 绝对路径'],
+    [[...measureDirs({ command: 'cd C:/work/projB && npm test' })], ['c:/work/projb'], 'Windows cd 绝对路径'],
+    [[...measureDirs({ workdir: '/home/u', command: 'cd projB && npm test' })].sort(), ['/home/u', '/home/u/projb'], 'cd 相对路径靠 workdir 落地'],
+    [[...measureDirs({ command: 'cd projB && npm test' })], [], 'cd 相对又没有 workdir → 不猜'],
+    [[...measureDirs({ workdir: '/home/u/projB', command: 'npm test' })], ['/home/u/projb'], 'workdir 原样'],
+    [[...measureDirs({ command: 'npm test -- src/a.test.js' })], [], '测试文件路径不带绝对路径 → 不猜']
+  ]
+  const bad = cases
+    .filter(([actual, expected]) => JSON.stringify(actual) !== JSON.stringify(expected))
+    .map(([, , label]) => label)
+  check('measureDirs 认 cd 形式', bad.length === 0, bad.length === 0 ? `${cases.length} 项` : bad.join(', '))
+}
+
+// ── 28l. 端到端：兄弟目录的测试不得洗白这个目录的盲改
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const mine = '/home/u/projA/src/a.js'
+  const steps = [
+    [(s, c) => edit(mine)(s, c)],
+    [(s, c) => edit(mine)(s, c)],
+    [(s, c) => measure('m1', { command: 'cd /home/u/projB && npm test', exit: 0 })(s, c)],
+    [(s, c) => edit(mine)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('A: 兄弟目录的测量（cd 形式）不清这个目录的盲改', injected.length > 0, `injections=${injected.length}`)
 }
 
 // ── 29. 导出形状

@@ -222,7 +222,7 @@ dsh plugin add dsh-better-debug
 **或者从 Release tarball 装（pnpm 会把它当普通包装进 profile）：**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.1/dsh-better-debug-0.2.1.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.2/dsh-better-debug-0.2.2.tgz
 ```
 
 （两条装的是同一个包：npm 上的 tarball 与 Release 资产逐字节相同。走 npm 的好处是
@@ -363,14 +363,14 @@ bundle 层按原样加载」。也就是说：**写了 config，用户点「启�
 
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
-node test/sim.mjs           # 40 个用例：闸门语义 + 可移植性
+node test/sim.mjs           # 46 个用例：闸门语义 + 可移植性
 node test/panel.mjs         # 32 个用例：日志解析、聚合、埋点落盘
 npm run test:posix          # 把上面两套用 POSIX 路径语义再跑一遍
 npm run verify              # 上面全部（含语法检查）
 ```
 
 `test/sim.mjs` 用假 ctx 复刻 agent-loop 的调用顺序（`emitPlain` / `emitWaterfall`），
-覆盖 **40 个用例**。
+覆盖 **46 个用例**。
 
 语义层（每条都有正例 + 反例）：
 
@@ -402,7 +402,7 @@ npm run verify              # 上面全部（含语法检查）
 ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以这条不会退回去。
 （24 不是凑数：桌面版 DSH 跑的是 Electron 内置的 node 24。）
 
-同一类问题的另外四处，都在 v0.2 / v0.2.1 修掉了：
+同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 修掉了：
 
 | 症状 | 根因 | 现在 |
 | --- | --- | --- |
@@ -411,6 +411,9 @@ ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以�
 | 插件静默不加载，无报错无日志 | 静态 `inject: ['skills']` 缺服务时 `apply()` 整个不执行 | `inject = []`，走 `ctx.inject` 动态订阅 |
 | 市场点「启用」没反应 | bundle patch 带 `config:` 块 | patch 只留 `id` + `name` |
 | 宿主版本太旧也不拦 | 版本范围写在 `dsh.engines.dsh`，而宿主与市场只读顶层 `engines.dsh` | 移到顶层 `engines.dsh` |
+| 新项目里一报错就误报「同一个操作重复报错」 | node 的栈是 `file:///C:/...`，路径正则先撞上 scheme 里的 `e:`，每份栈都变成 `"e:///c"` | `stripFileUrl` 先剥 URL 头 |
+| `a1.js` 与 `a2.js` 被当成同一处 | 归一化把路径里每个数字都换成 `<n>`，只该剥行号列号 | 只剥末尾 `(:\d+)+$` |
+| 在兄弟目录跑测试，把这个目录的盲改计数洗白了 | `measureDirs` 把 `cd <dir>` 当文件取父目录（`cd ~/projB` → `~`） | 认 `cd` 形式，那段路径按目录处理 |
 
 **大小写折叠按平台判**（`CASE_INSENSITIVE`）：只在 `win32` / `darwin` 上折叠。折叠错了的
 后果不对称——该折叠却不折叠是漏报，不该折叠却折叠是**误报**（狼来了），后者才是这道闸门
