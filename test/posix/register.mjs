@@ -13,7 +13,16 @@
 //     deprecated（DEP0205「Use module.registerHooks() instead」）。
 // 只写老的那条会在新 node 上每次跑测试都刷一行弃用告警；只写新的那条会让
 // engines.node >=20 的老用户直接跑不起来。所以两条都留着，运行时挑。
-import { register, registerHooks } from 'node:module'
+//
+// 必须用命名空间导入，不能 `import { registerHooks }`：具名导入在
+// **模块实例化阶段**就核对导出名，node 20 上根本没有 registerHooks，
+// 于是 `SyntaxError: does not provide an export named 'registerHooks'`
+// —— 下面的 typeof 判断连执行机会都没有，整轮 posix 测试直接起不来。
+// 这跟插件的静态 inject 是同一类错误：用一个「可能不存在的东西」去门控，
+// 却把「不存在」写成了加载期硬失败。
+import * as nodeModule from 'node:module'
+
+const { register, registerHooks } = nodeModule
 
 const PATH_SHIM = new URL('./path.mjs', import.meta.url).href
 

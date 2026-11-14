@@ -699,14 +699,24 @@ const has = (injected, needle) => injected.find((entry) => entry.texts.some((t) 
   const explicitOff = resolveLogFile({ logFile: '' })
   const falseOff = resolveLogFile({ logFile: false })
   const verbatim = resolveLogFile({ logFile: 'C:/tmp/x.log' })
+  // DSH_HOME 被写成相对路径时，日志也跟着相对 → 会落到「进程当时的 cwd」，
+  // 而插件跑在 DSH 主机进程里，那个 cwd 由用户从哪儿启动决定，事后没人猜得到。
+  process.env.DSH_HOME = 'relhome'
+  const relHome = resolveLogFile({})
+  process.env.DSH_HOME = ''
+  const emptyHome = resolveLogFile({})
   if (savedDshHome !== void 0) process.env.DSH_HOME = savedDshHome
+  else delete process.env.DSH_HOME
 
   const cases = [
-    [fallback.includes('.dsh') && fallback.endsWith('better-debug.log'), '不写 logFile → 默认落盘'],
+    [fallback.includes('.dsh') && fallback.endsWith('better-debug.log') && !fallback.includes('dsh-better-debug.log'), '不写 logFile → 默认落盘，且文件名与文档一致'],
     [!viaHome.includes('~') && viaHome.endsWith('x.log'), '~ 被展开'],
     [explicitOff === '', '空串 = 显式关闭'],
     [falseOff === '', 'false = 显式关闭'],
-    [verbatim === 'C:/tmp/x.log', '绝对路径原样使用']
+    [verbatim === 'C:/tmp/x.log', '绝对路径原样使用'],
+    [isAbsPath(relHome), 'DSH_HOME 是相对路径 → 日志仍解析成绝对路径'],
+    [relHome.endsWith('better-debug.log'), '相对 DSH_HOME 的文件名不变'],
+    [isAbsPath(emptyHome) && emptyHome.includes('.dsh'), 'DSH_HOME 为空串 → 退回 ~/.dsh']
   ]
   const bad = cases.filter(([pass]) => !pass).map(([, label]) => label)
   check('resolveLogFile 四种写法', bad.length === 0, bad.length === 0 ? `${cases.length} 项` : bad.join(', '))
