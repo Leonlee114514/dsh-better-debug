@@ -222,7 +222,7 @@ dsh plugin add dsh-better-debug
 **或者从 Release tarball 装（pnpm 会把它当普通包装进 profile）：**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.3/dsh-better-debug-0.2.3.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.4/dsh-better-debug-0.2.4.tgz
 ```
 
 （两条装的是同一个包：npm 上的 tarball 与 Release 资产逐字节相同。走 npm 的好处是
@@ -366,6 +366,7 @@ node --check lib/index.js && node --check lib/panel.js && node --check lib/text.
 node test/sim.mjs           # 46 个用例：闸门语义 + 可移植性
 node test/panel.mjs         # 40 个用例：日志解析、聚合、世代判定、埋点落盘
 npm run test:posix          # 把上面两套用 POSIX 路径语义再跑一遍
+npm run test:linux          # 再把上面两套用 Linux 平台语义（不折叠大小写）跑一遍
 npm run verify              # 上面全部（含语法检查）
 ```
 
@@ -387,7 +388,7 @@ npm run verify              # 上面全部（含语法检查）
 
 **不依赖 DSH 运行时**，改动后先跑它。
 
-### 为什么有 `test:posix` 这一轮
+### 为什么有 `test:posix` 与 `test:linux` 两轮
 
 `test/sim.mjs` 里的路径全是 `C:/work/...` 这种 Windows 方言。它在一台 Linux 机器上照样
 能跑，但跑的是**另一套语义**——这正是 v0.2 之前的一个真事故：
@@ -402,6 +403,18 @@ npm run verify              # 上面全部（含语法检查）
 ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以这条不会退回去。
 （24 不是凑数：桌面版 DSH 跑的是 Electron 内置的 node 24。）
 
+`test:linux` 补的是另一根轴。`test:posix` 只换 `node:path`，**不伪造 `process.platform`**，
+所以那一轮里 `CASE_INSENSITIVE` 仍然是 `true`。大小写折叠这条分支因此在本机永远不执行——
+直到 2026-11-14，真机 ubuntu CI 把 v0.2.2 的两组新断言打红：期望值写死成小写
+（`c:/users/u/...`、`['/home/u/projb']`），而 Linux 上路径区分大小写、原样保留大小写。
+根因不在被测代码，在**断言本身也沾了本机平台**——它测的是「Windows 上通过」。
+
+`test/linux/register.mjs` 只把 `process.platform` 覆盖成 `linux`（它是 getter，必须
+`Object.defineProperty`；直接赋值会被静默忽略），不碰 path 模块。两轴分开之后，
+「path 方言 × 大小写敏感」四种组合里有三种能在 Windows 开发机上跑到，剩下的
+Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是用 `samePath` / `sameDirs`
+按平台比较，期望值用**原始大小写**书写（`C:/Users/u/...`、`/home/u/projB`）。
+
 同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 修掉了：
 
 | 症状 | 根因 | 现在 |
@@ -415,6 +428,7 @@ ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以�
 | `a1.js` 与 `a2.js` 被当成同一处 | 归一化把路径里每个数字都换成 `<n>`，只该剥行号列号 | 只剥末尾 `(:\d+)+$` |
 | 在兄弟目录跑测试，把这个目录的盲改计数洗白了 | `measureDirs` 把 `cd <dir>` 当文件取父目录（`cd ~/projB` → `~`） | 认 `cd` 形式，那段路径按目录处理 |
 | 面板永远红着脸说「插件当前被关闭」，而它明明在跑 | 横幅数的是**整份日志**里的 `disabled` / `panel failed`，历史里挂过一次就永久算「现在坏了」 | 横幅只认最后一次 `apply` 之后（`log.current`），历史单独的个数写在页脚 |
+| 新加的用例在 Windows 上全绿，真机 Linux CI 全红 | 断言把 `CASE_INSENSITIVE` 的折叠结果写死了；`test:posix` 只换 `node:path`、不伪造 `platform`，那条分支本机永不执行 | `test:linux` 轮覆盖 `process.platform`，断言改用 `samePath` 按平台比 |
 
 **大小写折叠按平台判**（`CASE_INSENSITIVE`）：只在 `win32` / `darwin` 上折叠。折叠错了的
 后果不对称——该折叠却不折叠是漏报，不该折叠却折叠是**误报**（狼来了），后者才是这道闸门

@@ -20,6 +20,16 @@ import {
   CASE_INSENSITIVE
 } from '../lib/index.js'
 
+// 大小写折叠是平台语义的一部分，不是巧合：win32 与 darwin 的文件系统不区分大小写，
+// 所以 errorTargetOf / measureDirs 会把路径折成小写；Linux 上路径区分大小写，原样保留。
+// 断言里写**原始大小写**的期望值，比较时才按平台决定折不折 —— 否则写出来的就是
+// 「Windows 上通过、Linux 上红」。2026-11-14 的真机 CI 正是这样把 0.2.2 的两组
+// 新断言打红的（本机 Windows + POSIX path shim 全绿，因为 shim 不伪造 platform）。
+const samePath = (actual, expected) =>
+  CASE_INSENSITIVE ? actual.toLowerCase() === expected.toLowerCase() : actual === expected
+const sameDirs = (actual, expected) =>
+  actual.length === expected.length && actual.every((dir, i) => samePath(dir, expected[i]))
+
 const log = []
 function makeCtx({ skills = true } = {}) {
   const listeners = new Map()
@@ -864,9 +874,9 @@ check(
     "TypeError: boom\n    at f (file:///home/u/proj/alpha/lib/parse.mjs:9:11)"
 
   const cases = [
-    [errorTargetOf(alphaStack) === 'c:/users/u/proj/alpha/lib/parse.mjs', `windows 栈取出真路径（得到 ${errorTargetOf(alphaStack)}）`],
+    [samePath(errorTargetOf(alphaStack), 'C:/Users/u/proj/alpha/lib/parse.mjs'), `windows 栈取出真路径（得到 ${errorTargetOf(alphaStack)}）`],
     [errorTargetOf(alphaStack) !== errorTargetOf(betaStack), '两个不同文件不是同一个目标'],
-    [errorTargetOf(posixStack) === '/home/u/proj/alpha/lib/parse.mjs', `posix 栈取出真路径（得到 ${errorTargetOf(posixStack)}）`],
+    [samePath(errorTargetOf(posixStack), '/home/u/proj/alpha/lib/parse.mjs'), `posix 栈取出真路径（得到 ${errorTargetOf(posixStack)}）`],
     [
       errorTargetOf("ENOENT: open 'C:/work/src/a1.js'") !== errorTargetOf("ENOENT: open 'C:/work/src/a2.js'"),
       '路径里的数字不归一（a1.js ≠ a2.js）'
@@ -875,7 +885,7 @@ check(
       errorTargetOf("ENOENT: open 'C:/work/proj1/a.js'") !== errorTargetOf("ENOENT: open 'C:/work/proj2/a.js'"),
       '目录名里的数字不归一（proj1 ≠ proj2）'
     ],
-    [errorTargetOf('file:///C:/a/b.mjs:12:29') === 'c:/a/b.mjs', '行号列号仍然剥掉'],
+    [samePath(errorTargetOf('file:///C:/a/b.mjs:12:29'), 'C:/a/b.mjs'), '行号列号仍然剥掉'],
     [
       errorTargetOf('file:///C:/a/b.mjs:12:29') === errorTargetOf('file:///C:/a/b.mjs:99:3'),
       '同一文件不同行号仍是同一目标'
@@ -939,15 +949,15 @@ check(
 // 从来没写过 `cd` 形式，所以这条一直没被测到。
 {
   const cases = [
-    [[...measureDirs({ command: 'cd /home/u/projB && npm test' })], ['/home/u/projb'], 'POSIX cd 绝对路径'],
-    [[...measureDirs({ command: 'cd C:/work/projB && npm test' })], ['c:/work/projb'], 'Windows cd 绝对路径'],
-    [[...measureDirs({ workdir: '/home/u', command: 'cd projB && npm test' })].sort(), ['/home/u', '/home/u/projb'], 'cd 相对路径靠 workdir 落地'],
+    [[...measureDirs({ command: 'cd /home/u/projB && npm test' })], ['/home/u/projB'], 'POSIX cd 绝对路径'],
+    [[...measureDirs({ command: 'cd C:/work/projB && npm test' })], ['C:/work/projB'], 'Windows cd 绝对路径'],
+    [[...measureDirs({ workdir: '/home/u', command: 'cd projB && npm test' })].sort(), ['/home/u', '/home/u/projB'].sort(), 'cd 相对路径靠 workdir 落地'],
     [[...measureDirs({ command: 'cd projB && npm test' })], [], 'cd 相对又没有 workdir → 不猜'],
-    [[...measureDirs({ workdir: '/home/u/projB', command: 'npm test' })], ['/home/u/projb'], 'workdir 原样'],
+    [[...measureDirs({ workdir: '/home/u/projB', command: 'npm test' })], ['/home/u/projB'], 'workdir 原样'],
     [[...measureDirs({ command: 'npm test -- src/a.test.js' })], [], '测试文件路径不带绝对路径 → 不猜']
   ]
   const bad = cases
-    .filter(([actual, expected]) => JSON.stringify(actual) !== JSON.stringify(expected))
+    .filter(([actual, expected]) => !sameDirs(actual, expected))
     .map(([, , label]) => label)
   check('measureDirs 认 cd 形式', bad.length === 0, bad.length === 0 ? `${cases.length} 项` : bad.join(', '))
 }

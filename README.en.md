@@ -184,7 +184,7 @@ dsh plugin add dsh-better-debug
 **Or from the Release tarball (pnpm treats it as a normal package):**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.3/dsh-better-debug-0.2.3.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.4/dsh-better-debug-0.2.4.tgz
 ```
 
 (Both install the same package: the npm tarball is byte-identical to the Release asset.
@@ -302,6 +302,7 @@ node --check lib/index.js && node --check lib/panel.js && node --check lib/text.
 node test/sim.mjs           # 46 cases: gate semantics + portability
 node test/panel.mjs         # 40 cases: log parsing, aggregation, generation scoping, instrumentation
 npm run test:posix          # re-runs both suites under POSIX path semantics
+npm run test:linux          # re-runs both suites under Linux platform semantics (no case folding)
 npm run verify              # all of the above (with syntax checks)
 ```
 
@@ -318,7 +319,7 @@ Semantics (each with a positive and a negative):
 
 **No DSH runtime required** — run it first after any change.
 
-### Why there is a `test:posix` pass
+### Why there are `test:posix` and `test:linux` passes
 
 Every path in `test/sim.mjs` is written in Windows dialect (`C:/work/...`). The suite still
 runs on a Linux box, but it exercises a *different* set of semantics — which was exactly a
@@ -335,6 +336,21 @@ and then **re-runs both suites unchanged** — so a Windows dev machine reproduc
 semantics. CI runs `npm run verify` on ubuntu / windows / macos × node 20 / 22 / 24, so this
 cannot quietly regress. (24 is not padding: the desktop build runs Electron's bundled node 24.)
 
+`test:linux` covers the other axis. `test:posix` swaps only `node:path` and **does not fake
+`process.platform`**, so `CASE_INSENSITIVE` stays `true` in that pass. The case-folding branch
+never executes on a Windows dev machine — until 2026-11-14, when real ubuntu CI turned the two new
+v0.2.2 assertions red: they hard-coded lowercase expectations (`c:/users/u/...`,
+`['/home/u/projb']`), while Linux keeps the case you wrote. The defect was not in the code under
+test but **in assertions that had absorbed this machine's platform** — they were testing "passes on
+Windows".
+
+`test/linux/register.mjs` overrides `process.platform` to `linux` and touches nothing else (it is
+a getter, so it needs `Object.defineProperty`; a plain assignment is silently ignored). With the
+two axes separated, three of the four "path dialect × case sensitivity" combinations run on a
+Windows dev machine and CI supplies the fourth. The assertions no longer hard-code a case:
+`samePath` / `sameDirs` compare per platform, and expectations are written in their **original
+case** (`C:/Users/u/...`, `/home/u/projB`).
+
 The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2 / v0.2.3:
 
 | Symptom | Root cause | Now |
@@ -348,6 +364,7 @@ The rest of the same family, all fixed in v0.2 / v0.2.1 / v0.2.2 / v0.2.3:
 | `a1.js` and `a2.js` are treated as the same place | normalisation replaced every digit in the path with `<n>`; only line/column should go | only the trailing `(:\d+)+$` is stripped |
 | Running tests in a sibling directory washed out this directory's blind-edit count | `measureDirs` treated `cd <dir>` as a file and took its parent (`cd ~/projB` → `~`) | `cd` is recognised; that segment is a directory |
 | The panel kept showing "the plugin is currently disabled" while it was clearly running | the banner counted `disabled` / `panel failed` over the **whole log**, so one historical failure counted as "broken now" forever | the banner only reads the generation after the last `apply` (`log.current`); history is reported separately in the footer |
+| New assertions were green on Windows and red on real Linux CI | they hard-coded the `CASE_INSENSITIVE` fold result; `test:posix` swaps `node:path` but not `platform`, so that branch never ran here | the `test:linux` pass overrides `process.platform`, and assertions compare through `samePath` per platform |
 
 **Case folding is decided per platform** (`CASE_INSENSITIVE`): only on `win32` / `darwin`.
 The cost of folding wrong is asymmetric — not folding when you should under-reports, folding
