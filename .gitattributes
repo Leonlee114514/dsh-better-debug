@@ -1,0 +1,24 @@
+* text=auto eol=lf
+
+# cordis.patch.yml 必须是 LF。
+#
+# DshMarket 的热挂载靠 dshmarket/lib/hot.js 里的 scanPatch() 解析 patch，
+# 它剥注释用的是 `#.*$` —— 锚点匹配不到行尾的 \r，于是以 CRLF 结尾的一行注释
+# 永远剥不干净。后果：这份 patch 被判定成「含 config 或表达式行」，市场拒绝
+# 热挂载，用户点「启用」没反应，只能重启 DSH。
+#
+# GitHub Actions 的 Windows runner 默认 core.autocrlf=true，仓库里没有
+# .gitattributes 时 checkout 会把这里所有文件转成 CRLF —— 于是「在 Windows
+# 上开发时一切正常、打包发出去在 Linux/macOS 上也正常、唯独 Windows 的 CI
+# 红」这种最难查的组合。这条 + 上面的 eol=lf 把它钉死。
+cordis.patch.yml text eol=lf
+
+# Windows 的 .bat/.cmd 必须是 CRLF，否则解释器会把行尾当命令的一部分。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制：不要让 git 尝试做行尾转换或 diff。
+*.tgz binary
+*.png binary
+*.jpg binary
+*.ico binary

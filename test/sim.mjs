@@ -797,11 +797,19 @@ check(
     onlyIdName && rows.length === 1 && rows[0].id === 'better-debug' && rows[0].name === 'dsh-better-debug',
     `keys=${[...keys].join(',')} rows=${JSON.stringify(rows)}`
   )
+  // 这条守的是「打出去的 tarball 里是 LF」，而 npm pack 直接读工作区文件，
+  // 所以工作区是 CRLF 就等于发了个坏包。CRLF 从哪来：Windows 上
+  // core.autocrlf=true（GitHub Actions 的 windows runner 默认就是）会把
+  // checkout 出来的文件全转成 CRLF —— 仓库里没有 .gitattributes 时必现。
+  // 修法是仓库根目录的 .gitattributes 里 `cordis.patch.yml text eol=lf`，
+  // 不是放宽这条断言：断言红了说明真要发出去的包是坏的。
   const crlf = /\r/.test(patch)
   check(
     'bundle patch 是 LF（CRLF 会让市场的注释剥离失效，永远读成含 config）',
     crlf === false,
-    crlf ? 'contains CR' : 'LF'
+    crlf
+      ? 'contains CR —— 检查 .gitattributes 里 cordis.patch.yml 是否 eol=lf，以及本地 core.autocrlf'
+      : 'LF'
   )
 }
 
