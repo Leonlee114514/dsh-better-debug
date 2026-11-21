@@ -4,20 +4,169 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>better-debug 观测面板</title>
+<script>
+/* 决定用亮色还是暗色。必须同步跑（不能等 DOMContentLoaded），
+ * 否则会先按默认亮色画一帧，暗色模式下闪一下白。
+ *
+ * 判据顺序：
+ *  1) 宿主（同源，可读）。宿主把主题写在 <body data-ds-dark-theme> 与
+ *     <html style="color-scheme"> 上；iframe 读的是宿主文档，不是自己的，
+ *     所以这条能跨过「自定义属性不继承」的边界。拿不到就往下退。
+ *  2) 系统偏好 prefers-color-scheme。
+ * 两条都拿不到就按亮色。
+ *
+ * 属性只有 light / dark 两种取值，不存在「什么都没设」的第三态 ——
+ * 这样它才是个能被断言的判据。
+ *
+ * 用户中途切换主题时靠 MutationObserver 跟随（同源才挂得上）；
+ * 挂不上就退回每秒比对一次，代价可以忽略。 */
+(function () {
+  'use strict'
+
+  var hostDocument = null
+  try {
+    var host = window.parent && window.parent !== window ? window.parent : null
+    if (host && host.document) hostDocument = host.document
+  } catch (error) {
+    hostDocument = null
+  }
+
+  function hostScheme() {
+    if (hostDocument === null) return null
+    try {
+      var body = hostDocument.body
+      if (body && body.hasAttribute('data-ds-dark-theme')) return 'dark'
+      var root = hostDocument.documentElement
+      var declared = root && root.style ? root.style.colorScheme : ''
+      if (declared === 'dark') return 'dark'
+      if (declared === 'light') return 'light'
+      return null
+    } catch (error) {
+      return null
+    }
+  }
+
+  function systemScheme() {
+    try {
+      return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+    } catch (error) {
+      return 'light'
+    }
+  }
+
+  function applyScheme() {
+    var scheme = hostScheme()
+    if (scheme === null) scheme = systemScheme()
+    var root = document.documentElement
+    if (root.getAttribute('data-bd-scheme') !== scheme) root.setAttribute('data-bd-scheme', scheme)
+  }
+
+  applyScheme()
+
+  if (hostDocument !== null) {
+    /* 有宿主：跟随宿主的主题切换（宿主把 data-ds-dark-theme 加/删在 body 上、
+       把 color-scheme 写在 html 的 style 上）。观察不到就退回轮询，不静默放弃。 */
+    try {
+      var observer = new hostDocument.defaultView.MutationObserver(applyScheme)
+      observer.observe(hostDocument.body, { attributes: true, attributeFilter: ['data-ds-dark-theme', 'style'] })
+      observer.observe(hostDocument.documentElement, { attributes: true, attributeFilter: ['style', 'data-ds-theme-source'] })
+    } catch (error) {
+      setInterval(applyScheme, 1000)
+    }
+  } else {
+    /* 单独打开面板（没有宿主）：跟系统的 prefers-color-scheme 走。 */
+    try {
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyScheme)
+    } catch (error) {
+      setInterval(applyScheme, 1000)
+    }
+  }
+})()
+</script>
 <style>
+  /* 亮/暗两套调色板都写在面板自己的文档里。
+   *
+   * 面板跑在 iframe 里，而宿主那套 --dsw-* 变量定义在宿主文档的 body 上：
+   * CSS 自定义属性不跨文档边界继承，所以在这里引用宿主的变量恒为空值。
+   * 更早的版本还写错了名字（--dsw-alias-text-primary、--dsw-alias-bg-elevated、
+   * --dsw-alias-border-subtle 在宿主里都不存在，宿主的叫 label-*、bg-layer-*、
+   * border-l*），于是每条都落回硬编码的深色回退值 —— 亮色模式下整块面板还是黑的。
+   * 现在改成自带两套，由 <html data-bd-scheme="light|dark"> 选。
+   * 属性由 head 里的小脚本设置：先问宿主（同源可读），读不到才退回系统设置。 */
   :root {
-    color-scheme: dark;
-    --bg: var(--dsw-alias-bg-base, #0f1115);
-    --card: var(--dsw-alias-bg-elevated, #171a20);
-    --card-border: var(--dsw-alias-border-subtle, #262b33);
-    --fg: var(--dsw-alias-text-primary, #e7ebf0);
-    --fg-dim: var(--dsw-alias-text-secondary, #9aa4b2);
-    --fg-faint: #6b7480;
-    --accent: #4f8cff;
-    --good: #35c46a;
-    --warn: #ffb020;
-    --bad: #ff6b6b;
+    color-scheme: light;
+    --bg: #ffffff;
+    --card: #ffffff;
+    --card-border: rgba(0, 0, 0, .10);
+    --track: rgba(0, 0, 0, .07);
+    --fg: #0f1115;
+    --fg-dim: #61666b;
+    --fg-faint: #81858c;
+    --accent: #4176e6;
+    --good: #12894a;
+    --warn: #8a5a00;
+    --bad: #c62f2f;
+    --fill-a: #d9622b;
+    --fill-b: #b57a00;
+    --fill-c: #4176e6;
+    --fill-d: #12894a;
+    --fill-e: #7c3aed;
+    --tag-a-bg: rgba(217, 98, 43, .12);
+    --tag-a-fg: #a8461b;
+    --tag-b-bg: rgba(176, 120, 0, .12);
+    --tag-b-fg: #8a5a00;
+    --tag-c-bg: rgba(65, 118, 230, .12);
+    --tag-c-fg: #2f5bb8;
+    --tag-ok-bg: rgba(18, 137, 74, .12);
+    --tag-ok-fg: #0f7a41;
+    --tag-bad-bg: rgba(198, 47, 47, .10);
+    --tag-bad-fg: #b02a2a;
+    --tag-warn-bg: rgba(176, 120, 0, .12);
+    --tag-warn-fg: #8a5a00;
+    --tag-purple-bg: rgba(124, 58, 237, .12);
+    --tag-purple-fg: #6d31c9;
+    --tag-plain-bg: rgba(97, 102, 107, .12);
+    --err-border: rgba(198, 47, 47, .35);
+    --err-bg: rgba(198, 47, 47, .07);
+    --err-fg: #7d1d1d;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  :root[data-bd-scheme="dark"] {
+    color-scheme: dark;
+    --bg: #151517;
+    --card: #232324;
+    --card-border: rgba(255, 255, 255, .12);
+    --track: rgba(255, 255, 255, .10);
+    --fg: #f9fafb;
+    --fg-dim: #cfd3d6;
+    --fg-faint: #adb2b8;
+    --accent: #7ba7ff;
+    --good: #57d189;
+    --warn: #ffc14d;
+    --bad: #ff8d8d;
+    --fill-a: #ff8a5b;
+    --fill-b: #ffb020;
+    --fill-c: #4f8cff;
+    --fill-d: #57d189;
+    --fill-e: #b28dff;
+    --tag-a-bg: rgba(255, 138, 91, .16);
+    --tag-a-fg: #ff9d78;
+    --tag-b-bg: rgba(255, 176, 32, .16);
+    --tag-b-fg: #ffc14d;
+    --tag-c-bg: rgba(79, 140, 255, .16);
+    --tag-c-fg: #7ba7ff;
+    --tag-ok-bg: rgba(53, 196, 106, .15);
+    --tag-ok-fg: #57d189;
+    --tag-bad-bg: rgba(255, 107, 107, .14);
+    --tag-bad-fg: #ff8d8d;
+    --tag-warn-bg: rgba(255, 176, 32, .14);
+    --tag-warn-fg: #ffc14d;
+    --tag-purple-bg: rgba(178, 141, 255, .15);
+    --tag-purple-fg: #c3a6ff;
+    --tag-plain-bg: rgba(154, 164, 178, .14);
+    --err-border: rgba(255, 107, 107, .4);
+    --err-bg: rgba(255, 107, 107, .08);
+    --err-fg: #ffd0d0;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
@@ -53,13 +202,13 @@
   .bars { display: flex; flex-direction: column; gap: 7px; }
   .bar { display: grid; grid-template-columns: 172px 1fr 64px; align-items: center; gap: 10px; }
   .bar .lab { font-size: 12px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .bar .track { height: 8px; border-radius: 4px; background: #232833; overflow: hidden; }
+  .bar .track { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
   .bar .fill { height: 100%; border-radius: 4px; background: var(--accent); transition: width .25s ease; }
-  .bar .fill.a { background: #ff8a5b; }
-  .bar .fill.b { background: #ffb020; }
-  .bar .fill.c { background: #4f8cff; }
-  .bar .fill.d { background: #57d189; }
-  .bar .fill.e { background: #b28dff; }
+  .bar .fill.a { background: var(--fill-a); }
+  .bar .fill.b { background: var(--fill-b); }
+  .bar .fill.c { background: var(--fill-c); }
+  .bar .fill.d { background: var(--fill-d); }
+  .bar .fill.e { background: var(--fill-e); }
   .bar .num { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); text-align: right; }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -69,15 +218,15 @@
   td.mono, th.mono { font-family: var(--mono); font-size: 11px; }
   tr:last-child td { border-bottom: 0; }
   .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-family: var(--mono); font-size: 10.5px; }
-  .tag.A { background: rgba(255,138,91,.16); color: #ff9d78; }
-  .tag.B { background: rgba(255,176,32,.16); color: #ffc14d; }
-  .tag.C { background: rgba(79,140,255,.16); color: #7ba7ff; }
-  .tag.verify { background: rgba(53,196,106,.15); color: #57d189; }
-  .tag.search { background: rgba(53,196,106,.15); color: #57d189; }
-  .tag.edit { background: rgba(255,107,107,.14); color: #ff8d8d; }
-  .tag.shell { background: rgba(255,176,32,.14); color: #ffc14d; }
-  .tag.method { background: rgba(178,141,255,.15); color: #c3a6ff; }
-  .tag.other { background: rgba(154,164,178,.14); color: var(--fg-dim); }
+  .tag.A { background: var(--tag-a-bg); color: var(--tag-a-fg); }
+  .tag.B { background: var(--tag-b-bg); color: var(--tag-b-fg); }
+  .tag.C { background: var(--tag-c-bg); color: var(--tag-c-fg); }
+  .tag.verify { background: var(--tag-ok-bg); color: var(--tag-ok-fg); }
+  .tag.search { background: var(--tag-ok-bg); color: var(--tag-ok-fg); }
+  .tag.edit { background: var(--tag-bad-bg); color: var(--tag-bad-fg); }
+  .tag.shell { background: var(--tag-warn-bg); color: var(--tag-warn-fg); }
+  .tag.method { background: var(--tag-purple-bg); color: var(--tag-purple-fg); }
+  .tag.other { background: var(--tag-plain-bg); color: var(--fg-dim); }
 
   .foot { margin-top: 22px; color: var(--fg-faint); font-size: 11.5px; line-height: 1.65; }
   .foot p { margin: 0 0 6px; }
@@ -85,8 +234,8 @@
   .foot code { font-family: var(--mono); font-size: 11px; }
   .empty { color: var(--fg-faint); font-size: 12px; padding: 14px 2px; }
   .err {
-    border: 1px solid rgba(255,107,107,.4); background: rgba(255,107,107,.08);
-    color: #ffd0d0; padding: 10px 12px; border-radius: 8px; font-size: 12px; margin-bottom: 14px;
+    border: 1px solid var(--err-border); background: var(--err-bg);
+    color: var(--err-fg); padding: 10px 12px; border-radius: 8px; font-size: 12px; margin-bottom: 14px;
   }
   .err code { font-family: var(--mono); }
 </style>

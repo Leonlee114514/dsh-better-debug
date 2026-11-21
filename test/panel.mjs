@@ -454,11 +454,18 @@ function check(label, pass, detail) {
   const hasStaleApiNote = html.includes('lg.current === undefined') && html.includes('这个页面比插件新')
   const hasNoBoundaryNote = html.includes('认不出是哪一次加载之后的记录')
   let scriptParses = false
-  const inline = html.match(/<script>([\s\S]*)<\/script>/)
-  if (inline !== null) {
+  // 页面里现在有两个 <script>（主题判定 + 主脚本）。必须逐块解析：
+  // 非贪婪 /<script>([\s\S]*?)<\/script>/g 逐块取，否则贪婪匹配会跨块
+  // 把两段拼成一段，中间隔着 </script><script> 就必然语法错误 —— 那是
+  // 断言写错，不是页面错。
+  const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+  if (blocks.length === 0) scriptParses = 'no <script> block'
+  else {
     try {
-      // 只做语法解析，不执行：避免页面脚本碰 document。
-      new Function(inline[1])
+      for (const block of blocks) {
+        // 只做语法解析，不执行：避免页面脚本碰 document。
+        new Function(block[1])
+      }
       scriptParses = true
     } catch (error) {
       scriptParses = `${error?.message ?? error}`
@@ -472,7 +479,97 @@ function check(label, pass, detail) {
     `hasStaleApiNote=${hasStaleApiNote}`
   )
   check('日志没有 apply 行时页面明说「不能当作现在健康」', hasNoBoundaryNote, `note=${hasNoBoundaryNote}`)
-  check('内联脚本能被解析（不执行）', scriptParses === true, `parses=${scriptParses}`)
+  check('每段内联脚本都能被解析（逐块，不执行）', scriptParses === true, `blocks=${blocks.length} parses=${scriptParses}`)
+}
+
+// ── 11e. 亮/暗两套调色板必须都在面板自己的文档里（iframe 里继承不到宿主的变量）
+// 用户 2026-11-21 的反馈是「面板没有考虑暗色亮色模式」——那时面板的 :root 里写着
+// var(--dsw-alias-text-primary, #e7ebf0) 之类，而宿主的真实名字是 --dsw-alias-label-primary；
+// 名字全落空、回退值又是深色，于是在亮色模式下整块面板仍然是黑的。
+// 这里直接读页面源码断言：两套都在、真有差异、不再引用宿主变量、样式规则区没有裸颜色。
+{
+  const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8')
+  const styleStart = html.indexOf('<style>')
+  const styleEnd = html.indexOf('</style>')
+  const style = styleStart >= 0 && styleEnd > styleStart ? html.slice(styleStart + '<style>'.length, styleEnd) : ''
+
+  const lightBlock = /:root\s*\{([\s\S]*?)\}/.exec(style)
+  const darkBlock = /:root\[data-bd-scheme="dark"\]\s*\{([\s\S]*?)\}/.exec(style)
+  const hasBoth = lightBlock !== null && darkBlock !== null
+  const varsIn = (block) => {
+    const map = new Map()
+    if (block === null) return map
+    for (const m of block[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) map.set(m[1], m[2].trim())
+    return map
+  }
+  const light = varsIn(lightBlock)
+  const dark = varsIn(darkBlock)
+  const REQUIRED = ['--bg', '--card', '--card-border', '--fg', '--fg-dim', '--accent', '--bad', '--good']
+  const bothDefine = REQUIRED.filter((name) => light.has(name) && dark.has(name))
+  // 两套必须真的不一样：背景与正文色都相同就说明只是复制了一遍。
+  // 同时要求两边都不是空集 —— 否则「空的 vs 空的」也会被算成「不同」。
+  const differs =
+    light.size > 0 &&
+    dark.size > 0 &&
+    light.get('--bg') !== dark.get('--bg') &&
+    light.get('--fg') !== dark.get('--fg')
+
+  // 亮度：正文色与背景的明暗关系必须相反，否则其中一套的对比度是反的。
+  const luma = (value) => {
+    const hex = /^#([0-9a-f]{6})$/i.exec(String(value ?? '').trim())
+    if (hex === null) return null
+    const n = parseInt(hex[1], 16)
+    return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255
+  }
+  const lightBg = luma(light.get('--bg'))
+  const lightFg = luma(light.get('--fg'))
+  const darkBg = luma(dark.get('--bg'))
+  const darkFg = luma(dark.get('--fg'))
+  const lightContrastOk = lightBg !== null && lightFg !== null && lightBg > 0.5 && lightFg < 0.5
+  const darkContrastOk = darkBg !== null && darkFg !== null && darkBg < 0.5 && darkFg > 0.5
+
+  // 不再引用宿主的变量名（它们在 iframe 里恒为空）。
+  const hostVarRefs = [...style.matchAll(/var\(--dsw-[a-z0-9-]+/gi)].length
+  // 样式规则区不该有裸颜色：允许出现的位置只有变量定义行。
+  const withoutVars = style.replace(/:root\s*\{[\s\S]*?\}/g, '').replace(/:root\[data-bd-scheme="dark"\]\s*\{[\s\S]*?\}/g, '')
+  const strayColors = withoutVars.match(/#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)/g) ?? []
+
+  // color-scheme 两套都该声明，否则滚动条/表单控件不跟随。
+  const lightScheme = /color-scheme:\s*light/.test(style)
+  const darkScheme = /color-scheme:\s*dark/.test(style)
+
+  // 主题属性的取值域只能是 light / dark：脚本里 setAttribute 的第二个参数
+  // 必须来自 hostScheme()/systemScheme()，而那两个函数只返回这两个字符串。
+  const setsSchemeAttr = html.includes("setAttribute('data-bd-scheme'")
+  const returnsOnlyTwo = (() => {
+    const fnNames = ['hostScheme', 'systemScheme']
+    for (const name of fnNames) {
+      const body = new RegExp(`function ${name}\\(\\)\\s*\\{([\\s\\S]*?)\\n  \\}`).exec(html)
+      if (body === null) return false
+      const returns = [...body[1].matchAll(/return\s+'([^']*)'/g)].map((m) => m[1])
+      if (returns.length === 0) return false
+      if (returns.some((v) => v !== 'dark' && v !== 'light')) return false
+    }
+    return true
+  })()
+  const onlyTwoStates = returnsOnlyTwo
+
+  check('面板自带亮/暗两套调色板，关键变量两边都定义', hasBoth && bothDefine.length === REQUIRED.length,
+    `blocks=${hasBoth} defined=${bothDefine.length}/${REQUIRED.length}` +
+      (bothDefine.length === REQUIRED.length ? '' : ` missing=${REQUIRED.filter((n) => !bothDefine.includes(n)).join(',')}`))
+  check('两套不是复制的：背景与正文色都不同', differs,
+    `light bg=${light.get('--bg')} fg=${light.get('--fg')} / dark bg=${dark.get('--bg')} fg=${dark.get('--fg')}`)
+  check('亮色是深字浅底、暗色是浅字深底（对比度方向没反）', lightContrastOk && darkContrastOk,
+    `light ${lightBg}->${lightFg} ok=${lightContrastOk} / dark ${darkBg}->${darkFg} ok=${darkContrastOk}`)
+  check('面板不再引用宿主变量（iframe 里继承不到）', hostVarRefs === 0, `hostVarRefs=${hostVarRefs}`)
+  check('样式规则区没有裸颜色字面量（全走变量）', strayColors.length === 0,
+    `stray=${strayColors.length ? strayColors.slice(0, 6).join(' ') : 'none'}`)
+  check('两套都声明 color-scheme（滚动条/表单控件跟随）', lightScheme && darkScheme,
+    `light=${lightScheme} dark=${darkScheme}`)
+  check('主题属性只有 light/dark 两态，且由脚本设置', setsSchemeAttr && onlyTwoStates,
+    `sets=${setsSchemeAttr} onlyTwo=${onlyTwoStates}`)
+  check('主题脚本写明「读宿主文档」而不是读自己（iframe 边界的根因）', html.includes('hostDocument') && html.includes('data-ds-dark-theme'),
+    `hostDocument=${html.includes('hostDocument')} attr=${html.includes('data-ds-dark-theme')}`)
 }
 
 const failed = results.filter((r) => !r.pass)

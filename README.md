@@ -222,7 +222,7 @@ dsh plugin add dsh-better-debug
 **或者从 Release tarball 装（pnpm 会把它当普通包装进 profile）：**
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.5/dsh-better-debug-0.2.5.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.6/dsh-better-debug-0.2.6.tgz
 ```
 
 （两条装的是同一个包：npm 上的 tarball 与 Release 资产逐字节相同。走 npm 的好处是
@@ -364,7 +364,7 @@ bundle 层按原样加载」。也就是说：**写了 config，用户点「启�
 ```bash
 node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
 node test/sim.mjs           # 46 个用例：闸门语义 + 可移植性
-node test/panel.mjs         # 40 个用例：日志解析、聚合、世代判定、埋点落盘（慢盘轮多 1 条自检，41）
+node test/panel.mjs         # 48 个用例：日志解析、聚合、世代判定、亮暗配色、埋点落盘（慢盘轮多 1 条自检，49）
 npm run test:posix          # 把上面两套用 POSIX 路径语义再跑一遍
 npm run test:linux          # 再把上面两套用 Linux 平台语义（不折叠大小写）跑一遍
 npm run test:slow           # 把落盘拖慢 400ms，验证「等条件读日志」而不是等时长
@@ -433,7 +433,7 @@ Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是�
 稳定红，而「等条件」的写法不管慢多少都绿。这是回归防线，不是性能测试。
 `node < 22.15` 没有 `registerHooks`，这一轮自动跳过——与 `test:posix` 的两通道策略一致。
 
-同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 / v0.2.4 / v0.2.5 修掉了：
+同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 / v0.2.4 / v0.2.5 / v0.2.6 修掉了：
 
 | 症状 | 根因 | 现在 |
 | --- | --- | --- |
@@ -448,12 +448,13 @@ Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是�
 | 面板永远红着脸说「插件当前被关闭」，而它明明在跑 | 横幅数的是**整份日志**里的 `disabled` / `panel failed`，历史里挂过一次就永久算「现在坏了」 | 横幅只认最后一次 `apply` 之后（`log.current`），历史单独的个数写在页脚 |
 | 新加的用例在 Windows 上全绿，真机 Linux CI 全红 | 断言把 `CASE_INSENSITIVE` 的折叠结果写死了；`test:posix` 只换 `node:path`、不伪造 `platform`，那条分支本机永不执行 | `test:linux` 轮覆盖 `process.platform`，断言改用 `samePath` 按平台比 |
 | 同一份用例在本机 40/40，`windows-latest` + node 24 上 38/40 | 测试用固定 `sleep` 等日志落盘；插件刻意 `void record(...)` 不 `await`，慢盘上 `measure` 行还没写完就读了 | 读日志改成等条件（`readLogWhenReady`），并新增 `test:slow` 把落盘拖慢 400ms 当回归防线 |
+| 亮色模式下整块面板还是黑的 | 面板跑在 iframe 里，引用的 `--dsw-alias-text-primary` / `-bg-elevated` / `-border-subtle` 在宿主里根本不存在（宿主的叫 `label-*` / `bg-layer-*` / `border-l*`），而 CSS 自定义属性又不跨 iframe 继承 → 每条都落回硬编码的深色回退值 | 面板自带亮/暗两套调色板，由 `<html data-bd-scheme>` 选；属性由 head 里同步执行的小脚本设置，先问宿主的 `data-ds-dark-theme` / `color-scheme`，读不到才退回系统偏好 |
 
 **大小写折叠按平台判**（`CASE_INSENSITIVE`）：只在 `win32` / `darwin` 上折叠。折叠错了的
 后果不对称——该折叠却不折叠是漏报，不该折叠却折叠是**误报**（狼来了），后者才是这道闸门
 最不能犯的错。macOS 上装了区分大小写的 APFS 会少报一点，仍然是安全方向。
 
-`test/panel.mjs` 覆盖 **40 个用例**（慢盘轮 41 条：多的是那条「替身确实被用到」的自检——hook 没生效时它会红，避免整轮在测空气）：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
+`test/panel.mjs` 覆盖 **48 个用例**（慢盘轮 49 条：多的是那条「替身确实被用到」的自检——hook 没生效时它会红，避免整轮在测空气）：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
 `change` / `measure` / `arm` / `panel-failed`）、`charsFor` 与真实文案长度零漂移（6 组信号组合）、
 `worstStreak` 在日志→解析→聚合→面板全链路保留、`suppress` 与 `arm` 行可解析且不计入触发、
 聚合出的 `firstAction` / `turned` / `measures`、**断言 v0.1 的旧字段名
@@ -465,6 +466,12 @@ Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是�
 `apply` 之后又失败 → `log.current` 必须亮；日志里根本没有 `apply` 行 → `markers=0`，
 面板明说「读到的只是片段」，不冒充健康。**页面本身也被断言**——直接读 `web/index.html`，
 确认横幅读的是 `log.current`、没有残留按全量计数判红的老分支。
+
+亮暗配色也单列一组（同样直接读页面源码）：两套调色板都在、关键变量两边都定义、背景与正文色
+真的不同（空的 vs 空的会被算成相同）、亮色是深字浅底而暗色是浅字深底（对比度方向不许反）、
+不再引用任何宿主变量、样式规则区没有裸颜色字面量（全走变量）、两套都声明 `color-scheme`、
+主题属性的取值域只有 `light` / `dark`，以及那个脚本读的是**宿主文档**（`data-ds-dark-theme`）
+而不是自己的 —— 后者正是 iframe 继承断裂的根因，写错就退化成「只跟系统走」。
 
 ## 已知边界
 
