@@ -176,6 +176,81 @@ function check(label, pass, detail) {
   )
 }
 
+// ── 4b. 方案层信号（F/O/P/M）与 futile 行：解析、聚合、旧日志兼容
+//
+// 这一层的数据形状是新增的，面板最容易在这里悄悄漏掉一条：
+// bySignal 少一个键，那条信号在条形图上就永远是 0（看起来像「从没响过」）。
+{
+  const fLine = parseLine(
+    '2026-11-24T15:27:38.308Z inject session=s-1 turn=1 step=5 signals=F inj=36d335f2 chars=297 tokens=207 files=0 worstEdits=0 worstStreak=0 worstErrors=2 searched=false measured=no sample="TypeError: alpha is not a function"'
+  )
+  const mLine = parseLine(
+    '2026-11-24T15:27:38.340Z inject session=s-1 turn=1 step=14 signals=M inj=9f9f9f9f chars=264 tokens=190 files=1 worstEdits=5 worstStreak=0 worstErrors=0 searched=false measured=no futile=2'
+  )
+  check('parseLine 认 signals=F（方案层信号照旧进同一形状）', fLine.kind === 'inject' && fLine.signals.includes('F'), fLine.signals)
+  check('parseLine 认 signals=M 与 futile= 附加字段', mLine.kind === 'inject' && mLine.signals.includes('M'), mLine.signals)
+
+  const futileLine = parseLine(
+    '2026-11-24T15:27:38.330Z futile session=s-1 turn=1 inj=42aaa905 after=3 count=2 window=6'
+  )
+  check(
+    'parseLine 认 futile（无效注入累计）',
+    futileLine.kind === 'futile' && futileLine.count === 2 && futileLine.window === 6 && futileLine.inj === '42aaa905',
+    JSON.stringify({ count: futileLine.count, window: futileLine.window })
+  )
+
+  const applyAdv = parseLine(
+    '2026-11-24T15:27:38.307Z apply pid=20268 logFile=.tmp-samples.log A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1'
+  )
+  check(
+    'parseLine 认 apply 的方案层阈值',
+    applyAdv.kind === 'apply' && applyAdv.family === '4/3' && applyAdv.oscillation === 3 &&
+      applyAdv.patchChain === 3 && applyAdv.meta === '2/1',
+    JSON.stringify({ F: applyAdv.family, O: applyAdv.oscillation, P: applyAdv.patchChain, M: applyAdv.meta })
+  )
+
+  const text = [
+    '2026-11-24T15:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1',
+    '2026-11-24T15:01:00.000Z inject session=s-1 turn=1 step=5 signals=F inj=i1 chars=297 tokens=207 files=0 worstEdits=0 worstStreak=0 worstErrors=2 searched=false measured=no',
+    '2026-11-24T15:02:00.000Z inject session=s-1 turn=1 step=8 signals=O inj=i2 chars=235 tokens=204 files=1 worstEdits=7 worstStreak=0 worstErrors=0 searched=false measured=yes:ops_bash:fail',
+    '2026-11-24T15:03:00.000Z inject session=s-2 turn=1 step=4 signals=P inj=i3 chars=242 tokens=197 files=1 worstEdits=3 worstStreak=0 worstErrors=0 searched=false measured=yes:ops_bash:fail',
+    '2026-11-24T15:04:00.000Z inject session=s-2 turn=1 step=14 signals=M inj=i4 chars=264 tokens=190 files=1 worstEdits=5 worstStreak=0 worstErrors=0 searched=false measured=no futile=2',
+    '2026-11-24T15:04:10.000Z futile session=s-2 turn=1 inj=42aaa905 after=3 count=1 window=6',
+    '2026-11-24T15:04:20.000Z futile session=s-2 turn=1 inj=42aaa905 after=9 count=2 window=6'
+  ].join('\n')
+  const a = aggregate(parseLog(text), { logFile: 'C:/x.log', exists: true, bytes: text.length })
+  check(
+    '聚合：bySignal 覆盖 F/O/P/M 四条（少一个键就是面板上永远为 0）',
+    a.injects.bySignal.F === 1 && a.injects.bySignal.O === 1 && a.injects.bySignal.P === 1 && a.injects.bySignal.M === 1 &&
+      a.injects.bySignal.A === 0 && a.injects.bySignal.B === 0 && a.injects.bySignal.C === 0,
+    JSON.stringify(a.injects.bySignal)
+  )
+  check(
+    '聚合：方案层阈值来自最后一条 apply',
+    a.advanced.family === '4/3' && a.advanced.oscillation === 3 &&
+      a.advanced.patchChain === 3 && a.advanced.meta === '2/1',
+    JSON.stringify(a.advanced)
+  )
+  check(
+    '聚合：futile 行计数与最近一次累计值',
+    a.futile.total === 2 && a.futile.bySession['s-2'] === 2 && a.futile.lastCount === 2,
+    JSON.stringify(a.futile)
+  )
+
+  // 老日志（v0.2.x）没有 F=/O=/P=/M= 也没有 futile 行：阈值必须是空串 / 0，不能瞎补默认值。
+  const legacy = aggregate(
+    parseLog('2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true'),
+    { logFile: 'C:/x.log', exists: true, bytes: 80 }
+  )
+  check(
+    '聚合：老 apply 行没有方案层字段时不编造阈值',
+    legacy.advanced.family === '' && legacy.advanced.oscillation === 0 &&
+      legacy.advanced.patchChain === 0 && legacy.advanced.meta === '' &&
+      legacy.futile.total === 0 && legacy.futile.lastCount === 0,
+    JSON.stringify(legacy.advanced) + ' ' + JSON.stringify(legacy.futile)
+  )
+}
+
 // ── 5. 空日志与坏行不能让面板炸
 {
   const a = aggregate(parseLog(''), { logFile: '', exists: false, bytes: 0 })
@@ -570,6 +645,75 @@ function check(label, pass, detail) {
     `sets=${setsSchemeAttr} onlyTwo=${onlyTwoStates}`)
   check('主题脚本写明「读宿主文档」而不是读自己（iframe 边界的根因）', html.includes('hostDocument') && html.includes('data-ds-dark-theme'),
     `hostDocument=${html.includes('hostDocument')} attr=${html.includes('data-ds-dark-theme')}`)
+}
+
+// ── 11f. 页面把七条信号都画出来，方案层阈值与 futile 也有位置
+// 只测数据形状不够：bySignal 有 F，页面却只画 A/B/C 的话，
+// 面板上那条信号永远显示 0，看起来就像「这层闸门从没生效」。
+{
+  const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8')
+  const styleStart = html.indexOf('<style>')
+  const styleEnd = html.indexOf('</style>')
+  const style = styleStart >= 0 && styleEnd > styleStart ? html.slice(styleStart + '<style>'.length, styleEnd) : ''
+  const lightBlock = /:root\s*\{([\s\S]*?)\}/.exec(style)
+  const darkBlock = /:root\[data-bd-scheme="dark"\]\s*\{([\s\S]*?)\}/.exec(style)
+  const varsIn = (block) => {
+    const map = new Map()
+    if (block === null) return map
+    for (const m of block[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) map.set(m[1], m[2].trim())
+    return map
+  }
+  const light = varsIn(lightBlock)
+  const dark = varsIn(darkBlock)
+
+  const signalBars = (() => {
+    // 从 `var bs = inj.bySignal` 起切：分母 total 写在 innerHTML 之前，
+    // 只从 innerHTML 起切会把分母漏掉，断言就变成「找不到 total」的假红。
+    const start = html.indexOf('var bs = inj.bySignal')
+    if (start < 0) return ''
+    const end = html.indexOf("$('advanced-bars')", start)
+    return end > start ? html.slice(start, end) : html.slice(start, start + 2500)
+  })()
+  const drawn = ['A', 'B', 'C', 'F', 'O', 'P', 'M'].filter((kind) => signalBars.includes('bs.' + kind))
+  check('页面画出七条信号（少画一条，那层闸门就永远显示 0）', drawn.length === 7, `drawn=${drawn.join('')}`)
+
+  // 分母那行是 `var total = Math.max(1, (bs.A || 0) + …)`：里面有嵌套括号，
+  // 用 `[^)]*` 截会只拿到第一个 `(bs.A || 0)`，所以按整行取。
+  const totalLine = signalBars.split('\n').find((line) => line.includes('var total = Math.max(1,')) ?? null
+  const totalCovers = ['A', 'B', 'C', 'F', 'O', 'P', 'M'].every(
+    (kind) => totalLine !== null && totalLine.includes('bs.' + kind)
+  )
+  check('条形图分母把这七条都算进去（否则某条会超过 100%）', totalCovers, totalLine ? totalLine.trim().slice(0, 60) : 'no total')
+
+  const advanced = (() => {
+    const start = html.indexOf("$('advanced-bars').innerHTML")
+    if (start < 0) return ''
+    return html.slice(start, start + 2500)
+  })()
+  const advKeys = ['adv.family', 'adv.oscillation', 'adv.patchChain', 'adv.meta', 'fut.total'].filter((k) =>
+    advanced.includes(k)
+  )
+  check(
+    '页面有方案层阈值与 futile 累计的位置',
+    advKeys.length === 5 && html.includes('id="advanced-bars"') && html.includes('id="advanced-note"'),
+    `keys=${advKeys.join(',')}`
+  )
+
+  const tagVars = ['--tag-f-bg', '--tag-f-fg', '--tag-o-bg', '--tag-o-fg', '--tag-p-bg', '--tag-p-fg', '--tag-m-bg', '--tag-m-fg']
+  const tagsBoth = tagVars.filter((name) => light.has(name) && dark.has(name))
+  check(
+    'F/O/P/M 的标签配色亮暗两套都有（否则暗色下标签看不见）',
+    tagsBoth.length === tagVars.length,
+    `defined=${tagsBoth.length}/${tagVars.length}` +
+      (tagsBoth.length === tagVars.length ? '' : ` missing=${tagVars.filter((n) => !tagsBoth.includes(n)).join(',')}`)
+  )
+
+  const tagRules = ['.tag.F', '.tag.O', '.tag.P', '.tag.M'].filter((rule) => style.includes(rule + ' {'))
+  check('F/O/P/M 的标签样式规则都在', tagRules.length === 4, `rules=${tagRules.join(',')}`)
+
+  // 方案层四条用 f/e/d/g 四个填充色，和 A/B/C 的 a/b/c 不能撞色
+  const fills = ['f', 'e', 'd', 'g'].filter((name) => light.has('--fill-' + name) && dark.has('--fill-' + name))
+  check('方案层四条条形各有自己的填充色（亮暗两套）', fills.length === 4, `fills=${fills.join('')}`)
 }
 
 const failed = results.filter((r) => !r.pass)

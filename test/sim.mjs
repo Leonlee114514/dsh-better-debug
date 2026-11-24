@@ -161,6 +161,10 @@ const measure = (id, { command = 'npm test', workdir, exit = 0 } = {}) =>
     isError: false
   })
 
+/** 一次「测量失败、但工具本身没报错」的运行：喂 O / P 用（isError=false 才进测量分支）。 */
+const runFail = (id, text, { command = 'npm test' } = {}) =>
+  tool(id, 'ops_bash', { args: { command, description: '跑测试' }, text, isError: false })
+
 /** 一次不算测量的 shell：`ls` 这类「看起来动了手、其实没测」的命令。 */
 const shell = (id, { command = 'ls -la', exit = 0 } = {}) =>
   tool(id, 'ops_bash', { args: { command, description: '看看目录' }, text: `[exit code: ${exit}]` })
@@ -977,6 +981,356 @@ check(
   ]
   const injected = await runTurn(ctx, agent, { turn: 1, steps })
   check('A: 兄弟目录的测量（cd 形式）不清这个目录的盲改', injected.length > 0, `injections=${injected.length}`)
+}
+
+// ── 30. F 正例：同一个目标换出三种不同报错 → 方案层闸门开口
+//
+// B 只说「这一个错重复了」，F 说「这里已经换了几种错」——后者才是
+// 「改来改去只换来下一个错误」的形状。两者会同时满足，所以还要断言
+// B 被压掉：留着它只是把同一件事说两遍。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const at = (msg) => `${msg}\n    at parse (file:///C:/work/src/a.mjs:12:29)`
+  const steps = [
+    [(s, c) => fail('f1', at('TypeError: alpha is not a function'))(s, c)],
+    [(s, c) => fail('f2', at('RangeError: beta out of bounds'))(s, c)],
+    [(s, c) => fail('f3', at('SyntaxError: gamma unexpected token'))(s, c)],
+    [(s, c) => fail('f4', at('TypeError: alpha is not a function'))(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '种不同报错')
+  check('F: 同一目标三种指纹四次报错 → 注入 F', injected.length === 1 && Boolean(hit), `injections=${injected.length}`)
+  check(
+    'F: 命中时压掉 B（同一件事不说两遍）',
+    Boolean(hit) && !hit.texts.some((t) => t.includes('同一个操作重复报错')),
+    hit ? hit.texts[0].slice(0, 40) : 'no inject'
+  )
+}
+
+// ── 30b. F 的重新武装：搜过之后，换一个目标再堆出新族，必须能再响一次
+//
+// 这条守的是一个真实死代码：重新武装原先写在「同族又错一次」的分支里，
+// 而族一旦被搜索过，收集端就用同一个条件把它整族跳过 —— 减 fired.F 永远读不到。
+//
+// 每族的三条报错必须**真的不同**：指纹会把数字归一成 <n>，靠 alpha-1 / alpha-2
+// 编号是造不出第二种指纹的（实测踩过，整族只剩一个指纹，F 永远不亮）。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const at = (file, msg) => `${msg}\n    at parse (file:///C:/work/src/${file}:3:11)`
+  const alpha = [
+    at('a.mjs', 'TypeError: alpha is not a function'),
+    at('a.mjs', 'RangeError: alpha out of bounds'),
+    at('a.mjs', 'SyntaxError: alpha unexpected token')
+  ]
+  const beta = [
+    at('b.mjs', 'TypeError: beta is not a function'),
+    at('b.mjs', 'RangeError: beta out of bounds'),
+    at('b.mjs', 'SyntaxError: beta unexpected token')
+  ]
+  const steps = [
+    [(s, c) => fail('g1', alpha[0])(s, c)],
+    [(s, c) => fail('g2', alpha[1])(s, c)],
+    [(s, c) => fail('g3', alpha[2])(s, c)],
+    [(s, c) => fail('g4', alpha[0])(s, c)],
+    [(s, c) => tool('g5', 'web_search', { args: { query: 'TypeError alpha' }, text: 'ok' })(s, c)],
+    [(s, c) => fail('g6', beta[0])(s, c)],
+    [(s, c) => fail('g7', beta[1])(s, c)],
+    [(s, c) => fail('g8', beta[2])(s, c)],
+    [(s, c) => fail('g9', beta[0])(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check(
+    'F: 搜索之后新目标的新族能再响一次（重新武装没写成死代码）',
+    injected.length === 2,
+    `injections=${injected.length}`
+  )
+}
+
+// ── 31. O 正例：同一个失败绿了又回来，且每次之间都有修改 → 振荡
+//
+// 判据是「同一个失败回来了」，不是「颜色变了」：健康 TDD 每轮的红都是新的，
+// 所以必须用同一段断言文本（数字被归一）来喂，才叫回到原地。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  // 必须带 [exit code: 1]：没有退出码时 ok 判为 true（工具没报错 = 这次跑成功了），
+  // 失败的测量就变成一次成功，O 永远数不到翻转。
+  const red = 'AssertionError: expected 3 to be 4\n    at C:/work/test/a.test.mjs:12:29\n[exit code: 1]'
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('o1', red)(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('o2')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('o3', red)(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('o4')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('o5', red)(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('o6')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('o7', red)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '翻转了')
+  check('O: 同一个失败三次回来 → 注入 O', injected.length === 1 && Boolean(hit), `injections=${injected.length}`)
+  check('O: 命中时不夹带 P（每次都重新绿过，不是补丁链）', Boolean(hit) && !hit.texts.some((t) => t.includes('轮「验证失败')), hit ? hit.texts[0].slice(0, 40) : 'no inject')
+}
+
+// ── 32. P 正例：失败 → 改 → 仍失败，每一轮都换一个新的失败 → 补丁链
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const red = (n) => `AssertionError: case-${n} failed\n    at C:/work/test/a.test.mjs:4:9\n[exit code: 1]`
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('p1', red('one'))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('p2', red('two'))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('p3', red('three'))(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '轮「验证失败')
+  check('P: 连续三轮修出下一个失败 → 注入 P', injected.length === 1 && Boolean(hit), `injections=${injected.length}`)
+  check(
+    'P: 文案指向「第 n+1 个补丁」而不是再说一次「重复」',
+    Boolean(hit) && hit.texts[0].includes('第 4 个补丁'),
+    hit ? hit.texts[0].slice(-60) : 'no inject'
+  )
+}
+
+// ── 33. M 正例：提醒过两次、窗口内只有改没有验证 → 元闸门，且只发一条
+//
+// 注意动作必须把 step 透传下去（(s, c, st) => …）：futile 的判据是
+// 「窗口内没等到转向」，窗口要靠 tool/call 事件里的 step 才算得出来。
+// 只写 (s, c) => … 的话 step 是 undefined，pending 永不过期，M 永远不会亮。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const stack = 'TypeError: boom\n    at C:/work/src/a.mjs:7:2'
+  const steps = [
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c, st) => fail('m1', stack)(s, c, st)], // 第 4 步 pre-step 落 A
+    [(s, c, st) => fail('m2', stack)(s, c, st)],
+    [(s, c, st) => shell('m3')(s, c, st)], // 第 6 步 pre-step 落 B
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c, st) => shell('m4')(s, c, st)], // 12 > 4+6 → 第一条 pending 作废
+    [(s, c, st) => shell('m5')(s, c, st)], // 13 > 6+6 → 第二条作废，futile=2
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const metas = injected.filter((entry) => entry.texts.some((t) => t.includes('元观察')))
+  check('M: 两次无效注入后落元闸门', metas.length === 1, `meta=${metas.length} injections=${injected.length}`)
+  check(
+    'M: 独立成条，不夹带 A/B/C/F/O/P 的观察句',
+    metas.length === 1 &&
+      !metas[0].texts.some(
+        (t) =>
+          t.includes('同一个文件连续改了') ||
+          t.includes('同一个操作重复报错') ||
+          t.includes('种不同报错') ||
+          t.includes('翻转了') ||
+          t.includes('轮「验证失败')
+      ),
+    metas.length === 1 ? metas[0].texts[0].slice(0, 40) : 'no meta'
+  )
+  check('M: 一个 turn 只落一次', metas.length === 1, `meta=${metas.length}`)
+}
+
+// ── 34. M 反例：每次提醒之后窗口内都有验证 → futile 一直是 0，不落 M
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => measure('v1')(s, c)], // 第 4 步 pre-step 落 A，随后立即验证
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => measure('v2')(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check(
+    'M 反例：提醒后立刻验证 → 不落元闸门',
+    injected.every((entry) => entry.texts.every((t) => !t.includes('元观察'))),
+    `injections=${injected.length}`
+  )
+}
+
+// ── 35. 反例：健康 TDD 多轮「失败 → 改 → 通过」不得触发 P / O / M
+//
+// 这是 F/O/P 最容易误报的形状：颜色来回变、每轮都在改、每轮都有测量。
+// 差别只在于每轮的红是**新的**失败，且每轮都真的绿了。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const red = (n) => `AssertionError: case-${n} not implemented\n    at C:/work/test/a.test.mjs:4:9\n[exit code: 1]`
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('t1', red(1))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('t2')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('t3', red(2))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('t4')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('t5', red(3))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('t6')(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('反例：健康 TDD 不触发 P / O / M', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 36. 反例：没有写入的 flaky 交替不算振荡
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const red = 'Error: flaky\n    at C:/work/test/a.test.mjs:9:1\n[exit code: 1]'
+  const steps = [
+    [(s, c) => runFail('q1', red)(s, c)],
+    [(s, c) => measure('q2')(s, c)],
+    [(s, c) => runFail('q3', red)(s, c)],
+    [(s, c) => measure('q4')(s, c)],
+    [(s, c) => runFail('q5', red)(s, c)],
+    [(s, c) => measure('q6')(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('反例：纯测量来回变（无写入）不触发 O', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 37. 反例：同一条命令原地重跑、不改任何东西，不算补丁链
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const red = (n) => `Error: variant-${n}\n    at C:/work/test/a.test.mjs:2:2\n[exit code: 1]`
+  const steps = [
+    [(s, c) => runFail('r1', red('x'))(s, c)],
+    [(s, c) => runFail('r2', red('y'))(s, c)],
+    [(s, c) => runFail('r3', red('z'))(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('反例：不改只重跑不触发 P', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 38. 反例：多文件正常重构不触发 F / O / P
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const steps = [
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => measure('w1')(s, c)],
+    [(s, c) => edit('/work/src/b.js')(s, c), (s, c) => measure('w2')(s, c)],
+    [(s, c) => edit('/work/src/c.js')(s, c), (s, c) => measure('w3')(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('反例：多文件逐处改+测量不触发任何信号', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 39. 配置：metaGate:false 关掉元闸门，其余信号照旧
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '', metaGate: false })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const stack = 'TypeError: boom\n    at C:/work/src/a.mjs:7:2'
+  const steps = [
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => fail('n1', stack)(s, c)],
+    [(s, c) => fail('n2', stack)(s, c)],
+    [(s, c) => shell('n3')(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => shell('n4')(s, c)],
+    [(s, c) => shell('n5')(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check(
+    'metaGate:false → 没有元闸门，A/B 照旧',
+    injected.every((entry) => entry.texts.every((t) => !t.includes('元观察'))) && injected.length === 2,
+    `injections=${injected.length}`
+  )
+}
+
+// ── 40. O 正例：交替振荡（改 A 让 B 红、改 B 让 A 红）也必须能数到
+//
+// 这是最常见的振荡形态：指纹按 A/B/A/B 轮换。只比对「上一个指纹」的写法在这里
+// 会每次 fail 都当成新失败而清零，四面全哑（曾经的实际 bug）。
+// 判据改为「绿过的失败又出现」后，A、B 都在近期集合里，第三次失败即可连续计数。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const redA = 'AssertionError: expected 3 to be 4\n    at C:/work/test/a.test.mjs:12:29\n[exit code: 1]'
+  const redB = 'TypeError: cannot read properties of undefined\n    at C:/work/test/b.test.mjs:8:5\n[exit code: 1]'
+  const steps = []
+  for (let i = 0; i < 8; i += 1) {
+    steps.push([(s, c) => edit('/work/src/a.js')(s, c), (s, c) => runFail(`x${i}`, i % 2 === 0 ? redA : redB)(s, c)])
+    steps.push([(s, c) => edit('/work/src/b.js')(s, c), (s, c) => measure(`y${i}`)(s, c)])
+  }
+  steps.push([])
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '翻转了')
+  check('O: 交替振荡（A/B 轮换）能数到翻转并注入', injected.length === 1 && Boolean(hit), `injections=${injected.length}`)
+  check(
+    'O: 同一轮振荡只提醒一次（不按每次 ok 重新武装）',
+    injected.length === 1,
+    `injections=${injected.length}`
+  )
+}
+
+// ── 41. M 反例（搜索版）：提醒后窗口内搜索也算转向 → futile 清零，不落 M
+//
+// 34 覆盖的是「验证」这条转向路径；搜索是另一条（外部先验），M 的输入必须同样认。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const search = (id) => tool(id, 'web_search', { args: { query: 'TypeError boom' }, text: 'ok' })
+  const steps = [
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c, st) => search('s1')(s, c, st)], // 第 4 步 pre-step 落 A，随后搜索
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c, st) => search('s2')(s, c, st)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check(
+    'M 反例：提醒后搜索也算转向 → 不落元闸门',
+    injected.every((entry) => entry.texts.every((t) => !t.includes('元观察'))),
+    `injections=${injected.length}`
+  )
 }
 
 // ── 29. 导出形状

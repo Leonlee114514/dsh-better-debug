@@ -111,6 +111,8 @@
     --fill-c: #4176e6;
     --fill-d: #12894a;
     --fill-e: #7c3aed;
+    --fill-f: #0f7a41;
+    --fill-g: #6d31c9;
     --tag-a-bg: rgba(217, 98, 43, .12);
     --tag-a-fg: #a8461b;
     --tag-b-bg: rgba(176, 120, 0, .12);
@@ -125,6 +127,14 @@
     --tag-warn-fg: #8a5a00;
     --tag-purple-bg: rgba(124, 58, 237, .12);
     --tag-purple-fg: #6d31c9;
+    --tag-f-bg: rgba(15, 122, 65, .12);
+    --tag-f-fg: #0b6135;
+    --tag-o-bg: rgba(13, 116, 128, .12);
+    --tag-o-fg: #0a5b64;
+    --tag-p-bg: rgba(150, 74, 0, .14);
+    --tag-p-fg: #8a4400;
+    --tag-m-bg: rgba(109, 49, 201, .16);
+    --tag-m-fg: #5a26ad;
     --tag-plain-bg: rgba(97, 102, 107, .12);
     --err-border: rgba(198, 47, 47, .35);
     --err-bg: rgba(198, 47, 47, .07);
@@ -149,6 +159,8 @@
     --fill-c: #4f8cff;
     --fill-d: #57d189;
     --fill-e: #b28dff;
+    --fill-f: #57d189;
+    --fill-g: #c3a6ff;
     --tag-a-bg: rgba(255, 138, 91, .16);
     --tag-a-fg: #ff9d78;
     --tag-b-bg: rgba(255, 176, 32, .16);
@@ -163,6 +175,14 @@
     --tag-warn-fg: #ffc14d;
     --tag-purple-bg: rgba(178, 141, 255, .15);
     --tag-purple-fg: #c3a6ff;
+    --tag-f-bg: rgba(87, 209, 137, .16);
+    --tag-f-fg: #8ae6ae;
+    --tag-o-bg: rgba(86, 200, 214, .16);
+    --tag-o-fg: #8fdde8;
+    --tag-p-bg: rgba(255, 176, 32, .18);
+    --tag-p-fg: #ffd08a;
+    --tag-m-bg: rgba(195, 166, 255, .20);
+    --tag-m-fg: #d9c6ff;
     --tag-plain-bg: rgba(154, 164, 178, .14);
     --err-border: rgba(255, 107, 107, .4);
     --err-bg: rgba(255, 107, 107, .08);
@@ -209,6 +229,8 @@
   .bar .fill.c { background: var(--fill-c); }
   .bar .fill.d { background: var(--fill-d); }
   .bar .fill.e { background: var(--fill-e); }
+  .bar .fill.f { background: var(--fill-f); }
+  .bar .fill.g { background: var(--fill-g); }
   .bar .num { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); text-align: right; }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -221,6 +243,10 @@
   .tag.A { background: var(--tag-a-bg); color: var(--tag-a-fg); }
   .tag.B { background: var(--tag-b-bg); color: var(--tag-b-fg); }
   .tag.C { background: var(--tag-c-bg); color: var(--tag-c-fg); }
+  .tag.F { background: var(--tag-f-bg); color: var(--tag-f-fg); }
+  .tag.O { background: var(--tag-o-bg); color: var(--tag-o-fg); }
+  .tag.P { background: var(--tag-p-bg); color: var(--tag-p-fg); }
+  .tag.M { background: var(--tag-m-bg); color: var(--tag-m-fg); }
   .tag.verify { background: var(--tag-ok-bg); color: var(--tag-ok-fg); }
   .tag.search { background: var(--tag-ok-bg); color: var(--tag-ok-fg); }
   .tag.edit { background: var(--tag-bad-bg); color: var(--tag-bad-fg); }
@@ -270,9 +296,16 @@
   </div>
 
   <div class="section">
-    <h2>三条信号各响了多少次</h2>
-    <p class="hint">一条注入可能同时命中多个信号，所以三者之和会大于触发次数。</p>
+    <h2>七条信号各响了多少次</h2>
+    <p class="hint">一条注入可能同时命中多个信号，所以各条之和会大于触发次数。A/B/C 是战术层（同一个动作在重复），F/O/P 是方案层（动作在变、方案没动），M 是元层（提醒过 N 次仍无转向）。</p>
     <div class="bars" id="signal-bars"></div>
+  </div>
+
+  <div class="section">
+    <h2>方案层闸门（F / O / P / M）</h2>
+    <p class="hint">阈值来自最近一次 apply 行；无效注入来自 futile 行。这些数字只描述「闸门按配置怎么判」，不证明它判对了。</p>
+    <div class="bars" id="advanced-bars"></div>
+    <p class="hint" id="advanced-note"></p>
   </div>
 
   <div class="section">
@@ -402,11 +435,33 @@
       : (meas.ok || 0) + ' 次成功 / ' + (meas.failed || 0) + ' 次失败（失败的测量同样算回路）· 累计清掉 ' +
         fmt(meas.cleared || 0) + ' 个文件的盲改计数'
 
-    var total = Math.max(1, (inj.bySignal && (inj.bySignal.A + inj.bySignal.B + inj.bySignal.C)) || 0)
+    var bs = inj.bySignal || {}
+    var total = Math.max(1, (bs.A || 0) + (bs.B || 0) + (bs.C || 0) + (bs.F || 0) + (bs.O || 0) + (bs.P || 0) + (bs.M || 0))
     $('signal-bars').innerHTML =
-      bar('A 同一文件连续盲改', (inj.bySignal && inj.bySignal.A) || 0, total, 'a') +
-      bar('B 同一操作重复报错', (inj.bySignal && inj.bySignal.B) || 0, total, 'b') +
-      bar('C 改完没有回路又动手', (inj.bySignal && inj.bySignal.C) || 0, total, 'c')
+      bar('A 同一文件连续盲改', bs.A || 0, total, 'a') +
+      bar('B 同一操作重复报错', bs.B || 0, total, 'b') +
+      bar('C 改完没有回路又动手', bs.C || 0, total, 'c') +
+      bar('F 同一目标上错误在变种', bs.F || 0, total, 'f') +
+      bar('O 同一组验证来回翻转', bs.O || 0, total, 'e') +
+      bar('P 补丁链：每轮修出下一个失败', bs.P || 0, total, 'd') +
+      bar('M 元闸门：提醒过仍无转向', bs.M || 0, total, 'g')
+
+    var adv = d.advanced || {}
+    var fut = d.futile || {}
+    $('advanced-bars').innerHTML =
+      bar('F 阈值（族次数/指纹数）', 0, 1, 'f').replace('<span class="num">0</span>',
+        '<span class="num">' + esc(adv.family || '—') + '</span>') +
+      bar('O 阈值（翻转次数）', 0, 1, 'e').replace('<span class="num">0</span>',
+        '<span class="num">' + esc(String(adv.oscillation || 0)) + '</span>') +
+      bar('P 阈值（补丁链轮数）', 0, 1, 'd').replace('<span class="num">0</span>',
+        '<span class="num">' + esc(String(adv.patchChain || 0)) + '</span>') +
+      bar('M 阈值（无效注入/开关）', 0, 1, 'g').replace('<span class="num">0</span>',
+        '<span class="num">' + esc(adv.meta || '—') + '</span>') +
+      bar('无效注入累计（futile 行）', fut.total || 0, Math.max(1, fut.total || 0), 'b')
+    $('advanced-note').textContent = (fut.total || 0) === 0
+      ? '还没有 futile 行：要么没注入过，要么每条注入之后都在窗口内转向了。'
+      : '共 ' + fut.total + ' 条 futile 行，最近一条累计 count=' + (fut.lastCount || 0) +
+        '（同一 turn 内累加，达到 M 阈值就开口一次并清零）。'
 
     var outTotal = Math.max(1, reported)
     $('outcome-bars').innerHTML = reported === 0

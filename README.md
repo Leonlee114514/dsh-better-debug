@@ -1,308 +1,263 @@
 # dsh-better-debug
 
-把「卡住闸门」从自觉条款变成代码闸门。
+面向编码场景的卡住检测插件（DeepSeek Harness / Cordis）。插件订阅 agent 的事件流，
+以**可复现的行为证据**判断模型是否陷入无效迭代，并在下一次模型请求之前注入一条
+结构化观察与恢复建议。它不读取模型的语言内容，不调用 LLM，不修改 agent loop。
 
-`AGENTS.md` 里的五条闸门与 `stuck-gate` 技能都是**提示词层**的约束——模型得先想起
-「我卡住了」，条款才开始生效。可卡住时的典型症状恰恰是**想不起来**：于是它写第 3 个
-「再试一次」、吃第 4 遍同一个报错、改完代码不跑任何验证。这个插件不看模型说了什么，
-只看它做了什么；一旦行为符合「原地打转」，就在**下一步之前**塞一句话进去。
+## 一个最小示例
 
-## 三个信号（v0.2 语义）
+下面是一段真实可发生的事件序列：每次修改都有验证，每次失败都不相同，
+但模型始终在同一组互相破坏的修改之间往返。
 
-| 信号 | 触发条件 | 默认阈值 | 为什么是它 |
+```
+改 A → npm test（红：断言 B 失败）
+改 B → npm test（绿）
+改 A → npm test（红：断言 B 失败）   ← 同一失败在绿过之后复发
+改 B → npm test（绿）
+改 A → npm test（红：断言 B 失败）   ← 第 2 次翻转
+改 B → npm test（绿）
+改 A → npm test（红：断言 B 失败）   ← 第 3 次翻转，触发 O
+```
+
+在下一步之前，插件向消息序列追加一条用户消息：
+
+```
+[better-debug] 观察到的重复动作（只是观察，不是结论）：
+- 同一组验证的结果已经在通过和不通过之间翻转了 3 次，每次翻转之间都有修改。
+下一步先做其中一件，拿到新事实再继续改：
+1) 修改在把问题来回推：先固定一个当前为红的用例，只做让它变绿的最小改动，其余改动先撤下；如果两次修改互相破坏，说明它们共享一个错误假设，先写出这个假设再动。
+恢复条件：拿到一条新的测量结果或一条外部事实后，继续动手即可。
+完整五条：skill `stuck-gate`。
+```
+
+同时落一行可 grep 的日志，供事后审计与面板统计：
+
+```
+inject session=… turn=1 step=19 signals=O inj=e7db4417 chars=235 tokens=204 files=2 worstEdits=5 worstStreak=0 worstErrors=0 searched=false measured=yes:ops_bash:fail
+```
+
+## 问题与方法
+
+「卡住时应当停下来建立反馈回路」这类约束通常写在系统提示或技能文件里，属于
+**自觉条款**：模型必须先意识到自己卡住，条款才会生效。而卡住的行为特征恰恰包括
+这种自我监测的失效——模型会持续写下第 N 次「再试一次」。
+
+本插件把其中**能够由事件证明**的部分从提示词层移到代码层，遵循三条原则：
+
+1. **只看行为，不看语言**。全部判据是事件计数、路径匹配与字符串归一化，
+   不解析 assistant 文本，不做语义或 LLM 判定。每个判定都可用同一段事件序列复现。
+2. **只陈述观察，不下诊断**。注入文本以「只是观察，不是结论」开头，
+   给出可数的事实（几次、几种、几轮）与至多两条恢复动作，并附恢复条件。
+3. **证据成本不对称，宁可漏报**。正常迭代被误打断的代价高于少提醒一次，
+   因此每个信号都配有明确的反例（见下文与测试用例）。
+
+## 信号模型
+
+七条信号分三层。战术层检测**动作重复**；方案层检测**动作变化但方向不变**；
+元层检测**干预本身失效**。
+
+| 层 | 信号 | 行为证据 | 默认触发条件 |
 | --- | --- | --- | --- |
-| **A** 同一文件**连续盲改** | `fs/write-intent` 按绝对路径计数；**一次真测量返回结果后**才清零该目录下的计数 | 第 **3** 次 | 单点反复摩擦且中间夹不进新事实，才是「没建回路就在猜」 |
-| **B** 同一**操作**反复吃错 | `tool/result` 按 `工具\|目标\|错误指纹` 组成 episode 计数；该 episode 之后搜过才免疫 | 第 **2** 次 | 同一个错两次说明第一次没读懂；按 episode 判，不会被别处的搜索免单 |
-| **C** 改完**又动手**却没回路 | 写入后过 N 步没测量 → 只**上膛**（`arm` 行），**下一次写入之前**才提醒 | **2** 步 | 改完就跑下一处是最常见的漏验证；但阅读阶段不该被打断 |
+| 战术 | **A** 连续盲改 | 同一绝对路径的 `fs/write-intent` 计数，测量结果返回后按目录清零 | 连续 **3** 次 |
+| 战术 | **B** 重复报错 | 同一 `工具\|目标\|错误指纹` 组成的 episode 计数；episode 之后搜索过则免疫 | 第 **2** 次 |
+| 战术 | **C** 改后未验证又写入 | 写入后 N 步无测量则上膛（arm），**下一次写入**才触发 | **2** 步 |
+| 方案 | **F** 错误族 | 同一 `工具\|目标` 上不同指纹的数量与总次数；族之后搜索过则免疫 | **3** 种指纹且共 **4** 次 |
+| 方案 | **O** 验证振荡 | 同一测量回路中，**绿过的失败指纹复发**（近期集合，容量 4），且两次结果之间有写入 | 第 **3** 次翻转 |
+| 方案 | **P** 补丁链 | 连续「测量失败 → 写入 → 测量仍失败」；成功测量清零 | 连续 **3** 轮 |
+| 元 | **M** 干预失效 | 注入后窗口内无测量/搜索，pending 作废计入 `futile` | 连续 **2** 次无效注入 |
 
-三条的判据都建立在「**测量**」这个概念上，而不是「调用了某个工具」。
+所有信号共享同一个基础概念——**测量（measurement）**，而非「调用了某个工具」。
 
-### 什么算一次测量
+### 测量的两态判定
 
-「工具被调用」≠「测量完成」。这是 v0.1 最大的漏洞：`edit → ls → edit → edit` 里那个
-`ls` 会把盲改计数洗白，于是真打转反而不响。
-
-v0.2 拆成两态：**测量意图**（`tool/call` 时按参数判）与**测量结果**（`tool/result` 回来后
-才记账）。只有结果回来才清零，并且只清与该命令目录相关的文件——在 `C:/other` 跑一遍
-`npm test` 不该洗掉 `C:/work/src/target.js` 的盲改计数。
+测量意图在 `tool/call` 时按参数判定，测量结果在 `tool/result` 返回后才记账。
+因此 `edit → ls → edit → edit` 不会被中间的 `ls` 洗白；在无关目录运行测试
+也不会清除目标文件的盲改计数。
 
 | 类别 | 工具 | 判据 |
 | --- | --- | --- |
 | 硬测量 | `lsp_diagnostics` `verify` `run_tests` `run_test` | 恒为测量 |
 | 软测量 | `ops_bash` `bash` `shell` `pwsh` | 命令命中 `measureCommands`，或描述命中 `measureIntent` 且命令不是 `ls/dir/cat/type/head/tail` |
-| 搜索 | `web_search` `research` `advanced_search` `multi_search` `platform_search` `domain_search` `cache_search` `video_search` | 命中即视为取得外部先验 |
-| 方法论 | `skill` | 加载方法论算有效转向，单独计数，不混进 `other` |
-| 编辑 | `edit` `write` `ops_write` `str_replace` `apply_patch` `notebook_edit` | |
+| 搜索 | `web_search` `research` `advanced_search` `multi_search` `platform_search` `domain_search` `cache_search` `video_search` | 视为取得外部先验 |
+| 方法论 | `skill` | 计为有效转向 |
+| 编辑 | `edit` `write` `ops_write` `str_replace` `apply_patch` `notebook_edit` | 计入写入序号 |
 
-**失败的测试仍然是有效测量**：它给出了「错在哪一行」这个新事实。`[exit code: 1]` 一样清零、
-一样算回路，面板里只把 `ok` 记成 `false`。
+**失败的测试仍是有效测量**：它提供了新事实。`[exit code: 1]` 同样清零盲改计数，
+仅在日志与面板中记为 `ok=false`。
 
-`DEFAULT_MEASURE_COMMANDS` 认：`npm/pnpm/yarn/bun` + `test|verify|check|lint|typecheck|build`、
-`node --test`、`pytest`、`vitest`、`jest`、`mocha`、`go test`、`cargo test`、`dotnet test`、
-`tsc`、`eslint`、`ruff check`、`mypy`、`git diff --stat`。任务类型不是代码时用
-`measureCommands` 换成自己的正则（词数统计、段数检查都行）。
+内置测量命令清单覆盖 `npm/pnpm/yarn/bun` 的 `test|verify|check|lint|typecheck|build`、
+`node --test`、`pytest`、`vitest`、`jest`、`mocha`、`go test`、`cargo test`、
+`dotnet test`、`tsc`、`eslint`、`ruff check`、`mypy`、`git diff --stat`，可用
+`measureCommands` 覆盖。生成物与锁文件由 `excludePaths` 排除，不计入盲改。
 
-**生成物不计入盲改**：`node_modules`、`dist`、`build`、`out`、`coverage`、`.git`、`.next`、
-`.cache`、各类 lock 文件、`*.log` / `*.map` / `*.min.js` 由 `excludePaths` 排掉。
+### 错误指纹、episode 与错误族
 
-### 错误 episode（B 的 key）
+- **目标**：报错正文中第一个路径，仅剥去末尾行号列号（`a.mjs:12:29` → `a.mjs`），
+  路径内其他数字保留（`a1.js` 与 `a2.js` 是不同目标）；`file://` 前缀先剥离。
+- **指纹**：首 6 行、前 300 字符，归一化十六进制数、路径与数字后取 sha256 前 16 位。
+  因此「行号变化但异常类不变」仍属同一 episode。
+- **B 的 key** 为 `工具|目标|指纹`，**F 的 key** 为 `工具|目标`（不含指纹）。
+  F 统计的正是指纹的**多样性**：`fingerprints.size ≥ 3 ∧ count ≥ 4`。
+  若 key 带指纹，每种新报错都会各自开 episode，F 即退化为更迟钝的 B。
 
-```
-工具名 | 目标 | 错误指纹
-```
+### O：为什么判据是「绿过的失败复发」
 
-- **目标**是报错正文里第一个像路径的东西（`C:/work/a.js`），行号归一成 `<n>`；
-- **指纹**是归一化后取首 6 行 / 前 300 字符的 sha256 前 16 位，`0x1f3a2b9c`→`<hex>`、
-  路径→`<path>`、`42`→`<n>`。
+振荡的朴素定义（结果在 ok/fail 间翻转）会把健康 TDD 误判为卡住：每轮的红都是
+尚未实现的新用例，颜色变化本身是进展。因此 O 要求失败**曾经出现过、其后变绿、
+如今复发**，且两次结果之间存在写入（纯测量重跑的 flaky 翻转不计）。
 
-所以「行号变了但异常类没变」仍算同一个 episode，而**两个不同文件各错一次 ENOENT 不算**。
+仅比对「上一次失败的指纹」仍会漏掉最常见的交替振荡——改 A 踩 B、改 B 踩 A，
+指纹按 A/B/A/B 轮换，每次失败都被误判为新失败。故判据使用**近期失败指纹集合**
+（FIFO，容量 `RECENT_FAIL_LIMIT = 4`）：新指纹只入队、不清零翻转计数。
 
-## 不做的事
+三种典型形态下的行为：
 
-- **不做「我猜是」措辞检测**：插件看不见模型的内心独白，这条留给 `stuck-gate` 技能自检。
-- **不做 no-op 写入判定**：`fs/write-intent` 拿到的只有 freshness token（`FsVersion` 或
-  `createIfAbsent`），不含内容，插件层拿不到 diff。
-- **不做收尾探针清零**：归 `dsh-turn-cleanup`。
-- **不用 `reject`**：那会把整个 turn 变成 no-op。只往 `messages` 尾部追加一条 user 消息。
-- **不对子会话生效**：`header.origin === 'subagent'` 或 `delegationDepth > 0` 一律跳过，
-  它们的 cwd 可能是别人的工作区，计数也没有可比性。
+| 形态 | 判定 |
+| --- | --- |
+| 交替振荡（A/B 互踩） | A、B 均在集合内，自第三次失败起连续计数，达阈值触发 |
+| 健康 TDD（每轮新失败） | 新指纹不在集合内，永不计数 |
+| 纯测量 flaky（无写入） | 不满足写入条件，不计 |
 
-## D 段例外
+O 的重新武装与「回路稳定」绑定：同一回路**连续两次成功**（翻转计数清零）后才允许
+再次触发。若按单次成功重新武装，振荡中每隔一步就会重复提醒同一局面。
 
-`AGENTS.md` 的 D 条：用户显式说「别搜了 / 直接改 / 快速试一下」时闸门不落。
-插件用**本 turn 用户原话**实现这条——命中 `/别搜|不要搜|不用搜|先别搜|直接改|快速试|别折腾|先试试/`
-就整 turn 静音。只认 `source.kind === 'user'` 的消息，插件自己注入的不算。
+### M：元闸门
+
+每条注入登记一个 pending。窗口（`changedWindow`，默认 6 步）内未出现测量或搜索，
+pending 作废并记 `futile += 1`；任何有效转向或成功测量将其清零。
+`futile` 达到 `metaAfterFutile`（默认 2）即触发 M。
+
+M 与其它信号在机制上有四点不同：
+
+- **优先级最高**，先于其余六条判定；
+- **不占** `maxInjectsPerTurn` 普通预算——最需要 M 的局面恰恰是预算已耗尽的局面；
+- **每 turn 至多一次**，且触发它的那一 step 不夹带其它信号；
+- **独立文案模板**：要求模型先写出已试方案清单、共享假设与一个机制上不同的方案
+  （或明确需要用户补充的现场产物），再发起修改类工具调用。
+
+## 干预的优先级与互斥
+
+同一 step 内信号不叠加陈述同一件事：
+
+- **P 与 F** 同时命中时只发 P（补丁链比错误族更接近方案层），F 记为已发；
+- **F/P 命中时压掉 B**（「这个错重复了」是弱化版观察），B 记为已发；
+- **A/B 命中时**，C 记为已发，不再补一句「改完没验证」；
+- **M** 始终单独成条。
 
 ## 幂等与重新武装
 
-不是「每类信号每 turn 一次」——那会让长 turn 的第二阶段永远没人管。v0.2 是**每个卡住
-episode 一次**：
+- 同一局面不重复提醒：上次注入后写入序号与错误序号均未变化则沉默；
+- 各信号按「什么算局面变了」分别重新武装：
 
-- 同一局面不重复（`lastFireMark` 的写序号与错序号都没变就再不开口）；
-- **有效测量之后重新武装**：`fired.A/C` 归零，同一 turn 里新的盲改可以再被提醒一次；
-- **每 turn 总预算** `maxInjectsPerTurn`（默认 3），防止变成连击。
+| 信号 | 重新武装条件 |
+| --- | --- |
+| A | 一次测量结果返回（仅清相关目录） |
+| B | 该 episode 之后发生搜索 |
+| C | 一次测量结果返回（解除上膛） |
+| F | 搜索，或一次成功测量 |
+| O | 同一回路连续两次成功 |
+| P | 一次成功测量 |
+| M | 每 turn 一次；有效转向清 `futile` |
 
-A/B 触发时会顺带把 C 标成已触发：A/B 已经说明了局面，再补一句「改完没验证」只是换个说法。
+- 普通信号共享每 turn 预算 `maxInjectsPerTurn`（默认 3）。
 
-## 触发前置
+## 触发前置与例外
 
-闸门只管「下一次尝试之前」，不管「交完货之后」。命中信号也先过三道前置：
-
-1. **done-state**：本 turn 出现过 **`present` 且结果成功**（`isError !== true`）→ **不注入**。
-   写一行 `suppress … reason=done`。**`present` 失败不休眠**——交付物没挂出去，闸门得继续醒着。
-   下一次 `fs/write-intent` 会把 done 复位。关掉：`doneOnPresent: false`。
-2. **有回路的收敛**：见上面「什么算一次测量」。关掉：`decayEditsOnVerify: false`。
-3. **任务类型**：写作 / 词数校准 / 版式收敛没有报错与失败测试，回路是一条能给出数字的
-   校验命令；注入文案已改成任务中立。
-
-边界：代码层只能认 `present` 这个动作。**纯文本终稿（没有 `present`）** 只能靠
-`stuck-gate` 技能里的 done-state 自检覆盖——两层互补，别指望插件读模型心思。
+1. **交付态**：`present` 成功返回后闸门休眠，下一次写入唤醒；`present` 失败不休眠。
+   休眠时写 `suppress … reason=done` 以便区分「醒着但沉默」与「未挂载」。`doneOnPresent: false` 关闭。
+2. **用户显式指令**：本 turn 用户原话命中
+   `/别搜|不要搜|不用搜|先别搜|直接改|快速试|别折腾|先试试/` 时整 turn 静音。
+   只认 `source.kind === 'user'` 的消息，插件自身注入不计。
+3. **子会话不生效**：`origin === 'subagent'` 或 `delegationDepth > 0` 一律跳过。
+4. **不使用 `reject`**：拦截只表现为向 `messages` 尾部追加一条用户消息，
+   不会把 turn 变成 no-op。
 
 ## 注入文案
 
-```
-[better-debug] 观察到的重复动作（只是观察，不是结论）：
-- 同一个文件连续改了 3 次，中间没有任何测量。
-下一步（挑一条就够）：
-1) 建一条几秒能跑完、能给出数字或事实的回路（失败测试 / 复现命令 / 一条断言 / lsp_diagnostics）；建不出来就停下要现场产物。
-恢复条件：拿到一条新的测量结果或一条外部事实后，继续动手即可。
-完整五条：skill `stuck-gate`。
-```
+普通信号采用固定骨架（观察 → 至多两条动作 → 恢复条件 → 技能指引），M 使用独立模板。
+全部文案的唯一来源是 `lib/text.js`，运行时注入与面板的老日志回填共用同一函数，
+因此字符/token 统计不会与真实文案漂移。
 
-三条纪律：
-
-1. **只陈述观察，不替模型下诊断**。原来那句「检测到你在原地打转」是在替它定性，现在改成
-   「观察到的重复动作（只是观察，不是结论）」。
-2. **最多给两条动作**。多给等于没给。
-3. **一定给恢复条件**。「怎么才能继续」比「你错了」有用。
-
-文案的唯一来源是 `lib/text.js`，`index.js`（注入）与 `panel.js`（老日志回填字符数）共用它，
-所以面板的字符估算不会与真实文案漂移。
-
-## 响应协议（提示词层，`stuck-gate` 技能）
-
-闸门触发后，把验证 / 搜索 / 清场 / 上下文压缩**静默一次性跑完**，期间不输出终稿措辞，
-全部结束后给**一个**结论。禁止「结论 → 一串工具调用 → 又一句结论」的倒挂。
-`[better-debug]` 只是提醒，不需要先用文字回应它。
-
-## 自带技能
-
-插件包内含 `assets/stuck-gate/SKILL.md`，通过 `inject: ["skills"]` 注册成 **bundled 技能**
-（`source: "bundled"`，`rank: 600`）——装完就出现在模型可见的技能目录里，不需要另外拷贝文件。
-
-注入的那句提醒末尾写着「完整五条：skill `stuck-gate`」，指的是这一份。
-
-**rank 关系**（数值小的优先）：
-
-| rank | 来源 | 谁说话 |
-| --- | --- | --- |
-| 100–200 | 项目级 `.dsh/skills`、`.agents/skills` | 项目覆盖 |
-| 300 | `custom` | |
-| 400 | `~/.dsh/skills`（用户全局） | **用户自己放的会压过本插件** |
-| 500 | `~/.agents/skills` | |
-| 600 | 本插件 `assets/` | 默认文案 |
-
-所以想改闸门措辞**不必改代码**：在 `~/.dsh/skills/stuck-gate/SKILL.md` 放一份就自动生效。
-改插件里的那份则对所有安装者生效（改了 `assets/` 下的文件，`get()` 每次重读，无需重启）。
-
-宿主若没有 `skills` 服务（老版本 DSH），注册会被跳过并记一行日志，**闸门本身照常工作**。
-
-## 观测面板
-
-日志只有一种人爱读，就是写它的人。面板把它变成一眼能看的东西：**设置页 → better-debug**，
-一个 iframe 视图，5 秒自刷新，只读，不改插件行为。
-
-四张主卡：
-
-| 卡 | 数据来源 | 能说明什么 |
-| --- | --- | --- |
-| 闸门触发次数 | 每条 `inject` 行 | 提醒一共说了几次，按 `A/B/C` 与组合标签分组 |
-| 覆盖会话 | `inject` 行的 `session=` 去重 | 影响了多少个会话、多少个轮次、注入文本共多少字符 / token |
-| **提示后首个动作** | `outcome` 行的 `class=` | 提醒之后第一条 `tool/call` 是什么类别。**描述性的，不证明因果** |
-| **测量回路（硬证据）** | `measure` 行 | 真正的测量发生了多少次、成功几次、失败几次、清掉了哪些盲改计数 |
-
-外加三个分布：信号分布、提示后首个动作六类、**窗口内是否真的转去取得新事实**
-（`change` 行，含中位步数）。
-
-### 指标措辞纪律
-
-这是 v0.1 面板最容易误导的地方，v0.2 明确拆开：
-
-- 「换动作率」这个名字**删掉了**。它算的是「提示后第一个工具属 verify/search 的比例」，
-  既不能证明提示促成了改变，更不能证明它帮你发现了缺陷——模型本来也可能这正是它下一步。
-  现在叫 **「提示后首个动作」**，字段名 `firstAction`。
-- 想知道「窗口内有没有转去取得新事实」，看 `turned`（只从 `change` 行算，有真中位步数）。
-  真正的 `medianSteps` 在这里才有样本——v0.1 那个恒为 `null`，因为 outcome 在下一步就写、
-  步差永远是 0。
-- **老日志不会被算成「0% 转向」**。v0.1 的 `inject` 行没有 `inj=`，也就不可能有 `change` /
-  `measure` 行；这时「转向 0 次」是**没测**，不是「测了没有」。`turned.observed` 是分母，
-  只数埋点上线后的注入，`rate` 在 `observed = 0` 时是 `null`，面板显示「这段日志早于
-  v0.2 埋点」。真实日志里 55 次注入全是老格式，`observed = 0` —— 面板现在会这么说，
-  而不是拿 49 条 outcome 当分母报一个 0%。
-- 「这些数字不证明什么」直接印在页脚：要证明增益，需要对照组或历史回放，面板两个都不做。
-- **不估算「省掉了多少 token」**。插件的职责是把可观测的事记下来，把判断留给看的人。
-
-### 为面板新增的埋点
-
-每次注入分到一个 `inj=`（8 位哈希），后续几行都带着它，于是同一次提醒的全生命周期可串起来：
+M 的完整模板：
 
 ```
-inject  session=… turn=39 step=88 signals=A inj=78ed6bc3 chars=309 tokens=271 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
-arm     session=… turn=39 gap=2
-outcome session=… turn=39 inj=78ed6bc3 after=A first=ops_bash class=verify steps=1 before=write
-measure session=… turn=39 tool=ops_bash ok=false exit=1 cleared=1
-change  session=… turn=39 inj=78ed6bc3 after=A tool=ops_bash class=verify steps=1
-suppress session=… turn=39 reason=done
+[better-debug] 元观察：这个 turn 里已经连续 2 次提醒没有换来转向。
+这不是「再试一次」能解决的问题了。下一步之前先写三段话（总共不超过 12 行）：
+1) 你已经试过的方案清单，以及它们共享的那个假设；
+2) 一个机制上不同的方案——换数据结构、换库、换责任层、或先造最小复现再重写，四选一，说明它为什么绕开了之前所有的墙；
+3) 如果写不出第 2 条，说明缺的是现场而不是尝试：列出你需要用户补充的一份具体产物（日志 / 最小复现 / 环境信息）。
+写完之前不要发起任何修改类工具调用。
 ```
 
-- `outcome` 只收**第一条**后续 `tool/call`：晚到的验证不能把早先的原地打转洗白。
-  `before=` 是提醒前的上一条动作（写入也计入，所以常见值是 `write`）。
-- `change` 只在注入后的 `changedWindow`（默认 6）步内写，窗口外自动丢弃。
-- `measure` 每次测量结果都写，带 `ok` / `exit` / `cleared`（清掉了几个文件的计数）。
-- 老日志没有 `chars=` 时，解析器用 `lib/text.js` 的 `charsFor(signals)` **真算一遍文案长度**，
-  v0.1 那张硬编码常量表（`A=254` 等，与真实文案差约 50 字符）已删除。
+## 适用范围与已知边界
 
-### 关掉面板
+**本插件面向编码场景设计与校准。** F 依赖报错文本中的路径与指纹，O/P 依赖可重复
+运行的验证命令，M 依赖「存在可建立的反馈回路」。写作、设计、数据分析等任务中
+「验证」不是一条命令，这些信号不可靠。插件**不做任务类型识别**；边界由配置划定
+（`metaGate: false` 关闭 M，调高 F/O/P 阈值等效于关闭）。
 
-`config: { panel: false }`。路由不挂，`/better-debug` 返回 404，闸门不受影响。
+其余边界：
 
-路由用 `ctx.inject(['webServer'], …)` **动态注入**，没有加进 `export const inject` ——
-后者是结构性变更，会让热重载失效，也会让没有 `webServer` 的宿主连闸门都装不上。
-宿主缺 `webServer` 时日志写一行 `panel unavailable: …`，挂载抛错写 `panel register failed: …`，
-面板会把它显示出来。
+- 「同一文件」按绝对路径判定，删除后重建同名文件仍计为同一处；
+- 测量判据是启发式正则，误判方向不对称：非测量当测量导致漏报，测量当非测量导致误报；
+- 交付态只认成功返回的 `present` 调用，纯文本终稿由 `stuck-gate` 技能的自检兜底；
+  从不调用 `present` 的任务可设 `doneOnPresent: false`；
+- 全部状态活在 **turn 内**，`turn/start` 重置，不做跨 turn 持久化；
+- 不判定 no-op 写入：`fs/write-intent` 不含内容，插件层拿不到 diff；
+- 收尾探针清零归 `dsh-turn-cleanup`，不在本插件职责内。
 
 ## 安装
 
-**最短一条（npm registry，已发布）：**
+npm registry：
 
 ```bash
 dsh plugin add dsh-better-debug
 ```
 
-**或者从 Release tarball 装（pnpm 会把它当普通包装进 profile）：**
+Release tarball（与 npm 包逐字节相同）：
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.2.6/dsh-better-debug-0.2.6.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.0/dsh-better-debug-0.3.0.tgz
 ```
 
-（两条装的是同一个包：npm 上的 tarball 与 Release 资产逐字节相同。走 npm 的好处是
-市场每日探测会自动把 `npm` 字段回填进目录条目，用户点一下就走 registry 快路。）
-
-**手动 link（要改代码就用这个）：**
+手动 link（用于本地修改）：
 
 ```bash
-# 1. 放到一个你长期保留的位置。别放临时目录，也别放 node_modules 里
-#    （下面以 ~/dsh-plugins/dsh-better-debug 为例，换成你自己的路径即可）
+# 1. 放到长期保留的位置（不要用临时目录或 node_modules）
 mkdir -p ~/dsh-plugins
 cp -r dsh-better-debug ~/dsh-plugins/
 
-# 2. profile 里加 link 依赖
-cd ~/.dsh/profiles/desktop
-# package.json → dependencies 加一行（路径相对 .dsh/profiles/desktop）：
-#   "dsh-better-debug": "link:../../../dsh-plugins/dsh-better-debug"
-# 也可以直接写绝对路径：
-#   "dsh-better-debug": "link:D:/code/dsh-better-debug"
-# package.json → dsh.profile.bundles 数组末尾加：
-#   "dsh-better-debug"
+# 2. 在 profile（如 ~/.dsh/profiles/desktop）中：
+#    package.json → dependencies 加：
+#      "dsh-better-debug": "link:../../../dsh-plugins/dsh-better-debug"
+#    package.json → dsh.profile.bundles 数组末尾加：
+#      "dsh-better-debug"
 
-# 3. 让 bundle patch 挂上（如果 bundles 已含它，dsh 会自动 apply 包内的 cordis.patch.yml）
-#    或者在自己的 profile cordis.patch.yml 里手写一行：
+# 3. 如需手写 patch，在自己的 profile cordis.patch.yml 中加：
 #      - id: better-debug
 #        name: dsh-better-debug
-#    注意：**不要加 `inject: [skills]`**，见下面「为什么不用静态 inject」。
-#    包内那行也**故意不带 config**，见「为什么 bundle patch 里没有 config」。
+#    不要加 inject: [skills]；包内 patch 故意不含 config，原因见下。
 
 # 4. 重启 DSH。
 ```
 
-> **别同时用两种挂法。** 包内 `cordis.patch.yml` 已有一行 `- id: better-debug`；如果你又在
-> profile 里手写同 id 一行，cordis 会 reject 重复 id。两行 id **不同**但指向同一包名更糟：
-> 插件被挂两次，每句提醒注入两遍、每行日志写两份。
+> 不要同时使用两种挂法。包内 `cordis.patch.yml` 已含 `- id: better-debug`，
+> 重复 id 会被 cordis 拒绝；不同 id 指向同一包则插件挂载两次，提醒与日志翻倍。
 
-### 为什么不用静态 inject
+### 两个刻意为之的打包决定
 
-`export const inject` 是空的，`cordis.patch.yml` 里也不写 `inject:` —— 这都是刻意的。
+**不使用静态 inject。** cordis 在任一声明服务缺失时将 epoch 置为 INACTIVE 并跳过
+`apply()`——无报错、无日志，插件看似已装载实则未运行。因此 `export const inject = []`，
+可选服务（`skills` / `webServer`）一律通过 `ctx.inject([...], cb)` 动态订阅：
+服务存在则启用对应功能，缺失仅损失可选功能，闸门照常工作。
 
-cordis 的 `Fiber._refresh()` 只要声明的服务里**有一个拿不到**，就把 epoch 置成 `INACTIVE`
-并直接不执行 `apply()`：没有报错、没有日志、面板里看起来装好了，实际一行代码都没跑。
-而 loader 还会把 YAML entry 的 `inject:` 合并进依赖集
-（`cordis-plugin-loader`：`Inject.resolve(entry.options.inject, fiber.inject)`），
-所以光改代码不够，配置里的那行同样会把插件卡死。
-
-`skills` 由 `@deepseek-ai/dsh-skill` 提供。裁剪过的 profile、别的发行版、或者只是没启用
-那个包时，它就不在——而闸门根本不需要它。两个可选服务（`skills` / `webServer`）一律走
-`ctx.inject(['skills'], cb)` 动态订阅：服务在就挂上，不在就少一个可选功能。
-
-面板同理：`client.js` 在 `slots` 不在时自己跳过注册，不影响闸门。
-想看面板就打开 **设置 → better-debug**，或直接访问 `http://<web-origin>/better-debug`。
-
-### 为什么 bundle patch 里没有 config
-
-包内的 `cordis.patch.yml` 只有两行 `id` + `name`，一个配置键都不写。原因是
-DshMarket 的热挂载只重放**纯 insert 行**：
-
-```js
-// dshmarket/lib/hot.js
-export function parseSimplePatch(patchText) {
-  const scan = scanPatch(patchText)
-  return scan.blocker === null ? scan.rows : null   // 一遇到别的键就 null
-}
-```
-
-`scanPatch()` 撞上 `config:` 就停下并把整份 patch 标成 `blocker: 'config'`，
-市场于是给用户看「bundle patch 里有 config 块,热挂载只重放纯 insert 行;重启后由
-bundle 层按原样加载」。也就是说：**写了 config，用户点「启用」不会有任何反应，
-必须重启 DSH**——新用户最容易在这一步以为插件坏了。
-
-每个默认值本来就已经在 `lib/index.js` 的 `normalizeConfig()` 里，那份 config 块
-只买到"自我文档"这一个好处，代价却是新手看不到任何反馈。所以默认值留在代码里，
-需要在 profile 里覆盖时再写 config——profile 那一行不参与包的热挂载，写什么都行。
+**bundle patch 不含 config。** 市场热挂载只重放纯 insert 行，patch 中出现 `config:`
+即被标记为 blocker，用户点「启用」不会有任何反应。默认值全部在
+`normalizeConfig()` 中，需要覆盖时写在**自己 profile** 的 patch 里。
 
 ## 配置
 
-全部默认值写在 `lib/index.js` 的 `normalizeConfig()` 里，装上就能跑。要改就在
-**自己 profile 的** `cordis.patch.yml` 里写同一 id（`- id: better-debug`）并加
-`config:` 块覆盖——不要改包内那份（下次升级会被覆盖，而且带 config 会让市场无法热挂载）：
+在**自己 profile** 的 `cordis.patch.yml` 中对同一 id 添加 `config:` 块：
 
 ```yaml
 - id: better-debug
@@ -311,184 +266,119 @@ bundle 层按原样加载」。也就是说：**写了 config，用户点「启�
     enabled: true
     repeatEditThreshold: 3        # A：同一文件连续改几次算盲改
     repeatErrorThreshold: 2       # B：同一 episode 错几次算打转
-    noVerifySteps: 2              # C：改完几步没测量才「上膛」
-    maxInjectsPerTurn: 3          # 单轮最多提醒几次
-    changedWindow: 6              # 注入后多少步内算「转向」窗口
-    decayEditsOnVerify: true      # 测量后清零连续盲改计数（false = 旧行为）
-    doneOnPresent: true           # present 成功后休眠，下一次写入重新武装（false = 旧行为）
-    measureCommands: ""           # 覆盖「什么命令算测量」的正则；空 = 内置清单
-    measureIntent: ""             # 覆盖「描述里出现什么算测量意图」的正则
-    excludePaths: ""              # 覆盖「哪些路径不算盲改」的正则
-    logFile: "~/.dsh/logs/better-debug.log"  # 支持 ~ 展开；不写就默认这个位置
-    panel: true                   # 挂 /better-debug 只读面板；false = 不挂路由
+    noVerifySteps: 2              # C：改完几步没测量才上膛
+    maxInjectsPerTurn: 3          # 单轮普通提醒预算（M 不受限）
+    changedWindow: 6              # 注入后的转向观察窗口（步）
+    repeatFamilyThreshold: 4      # F：错误族累计次数（3–20）
+    familyMinFingerprints: 3      # F：族内不同指纹数（2–10）
+    oscillationThreshold: 3       # O：第几次翻转触发（2–10）
+    patchChainThreshold: 3        # P：连续几轮失败—写入（2–10）
+    metaAfterFutile: 2            # M：连续几次无效注入（1–5）
+    metaGate: true                # M 总开关
+    decayEditsOnVerify: true      # 测量后清零盲改计数
+    doneOnPresent: true           # present 成功后休眠
+    measureCommands: ""           # 覆盖测量命令正则；空 = 内置清单
+    measureIntent: ""             # 覆盖测量意图正则
+    excludePaths: ""              # 覆盖盲改排除路径正则
+    logFile: "~/.dsh/logs/better-debug.log"
+    panel: true                   # 只读面板路由
 ```
 
-调紧（更容易触发）→ 数字调小；放松 → 调大。`enabled: false` 时连 listener 都不注册。
-三个正则键传坏正则会**回退到内置默认**并记一行 warn，不会把插件弄死。
+数值越界会被夹到边界值；三个正则键传入非法正则会回退内置默认并记 warn；
+`enabled: false` 时不注册任何 listener。
 
-`logFile` 的四种写法：
+`logFile` 的四种取值：
 
-| 写法 | 落到哪 |
+| 写法 | 行为 |
 | --- | --- |
-| 不写这个键 | `$DSH_HOME/logs/better-debug.log`（没设 `DSH_HOME` 就是 `~/.dsh/logs/better-debug.log`） |
-| `"~/my.log"` | 展开成家目录下的 `my.log`（`~` 和 `~/x`、`~\x` 都认） |
-| `"C:/x.log"` / `"/var/log/x.log"` | 原样使用 |
-| `""` 或 `false` | **显式关闭落盘**。`ctx.logger` 只进 Electron stdout，事后 grep 不到，面板也就没有数据 |
+| 不写 | `$DSH_HOME/logs/better-debug.log`（未设 `DSH_HOME` 时为 `~/.dsh/logs/better-debug.log`） |
+| `"~/my.log"` | 展开家目录 |
+| 绝对路径 | 原样使用 |
+| `""` 或 `false` | 显式关闭落盘（面板将无数据） |
 
-默认不落盘曾经是 v0.1 的行为，代价是新用户装完打开面板看到四张空卡，
-以为插件没工作。现在开箱就有数据。
+## 日志与观测面板
 
-## 怎么验证它真的在工作
+日志是唯一的验收面：`ctx.logger` 只进宿主进程 stdout，事后无法检索，因此所有关键
+事件都有落盘行型。加载成功必有一行：
 
-1. 装好重启后，日志默认就在 `$DSH_HOME/logs/better-debug.log`，不需要配置。
-   想换位置就设 `logFile`。
-2. 加载即有一行 `apply pid=… logFile=… A=3 B=2 C=2 budget=3 window=6 panel=true`——
-   **这一行是唯一能证明「插件到底加载了」的证据**（`ctx.logger` 只进 Electron stdout，
-   事后 grep 不到）。没有 `apply` 行就是没挂上。
-3. 正常干活，日志出现这样一行即为命中：
-   ```
-   inject session=… turn=32 step=98 signals=A inj=78ed6bc3 chars=309 tokens=271 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
-   ```
-   `signals` 是命中的信号（`A`/`B`/`C`，多条用 `+`）；`files` 是本 turn 碰过的**不同文件数**、
-   `worstEdits` 是累计改了几次，**`worstStreak` 才是 A 真正用的判据**（自上次测量以来的
-   连续盲改次数）。三者混着看：`files=1 worstEdits=3 worstStreak=1` 说明中间夹过测量，不该响。
-   `suppress … reason=done` 表示闸门醒着但处于交付态，故意不出声。
-   `arm … gap=2` 表示 C 只上了膛、还没开口（它在等你下一次写入）。
-4. 自证指标**不要**看「下一动作是不是 verify」。要看两件事：
-   - `measure` 行有没有出现（这是硬证据：真的测了）；
-   - `change` 行的 `steps=`（隔了几步才转去取得新事实）。
-   如果只有 `outcome` 没有 `measure`，说明模型只是换了个工具，没真的建立回路。
+```
+apply pid=… logFile=… A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1
+```
+
+**没有 `apply` 行即未挂载。** 其余行型：
+
+```
+inject   session=… turn=… step=… signals=A inj=78ed6bc3 chars=… tokens=… files=… worstEdits=… worstStreak=… worstErrors=… searched=… measured=…
+outcome  session=… inj=… after=A first=ops_bash class=verify steps=1 before=write
+measure  session=… tool=ops_bash ok=false exit=1 cleared=1
+change   session=… inj=… after=A tool=ops_bash class=verify steps=1
+futile   session=… inj=… after=A count=1 window=6
+arm      session=… turn=… gap=2
+suppress session=… reason=done
+```
+
+判读要点：`worstStreak` 才是 A 的判据（自上次测量以来的连续盲改），`worstEdits`
+只是 turn 内累计；`outcome` 仅记录第一条后续动作，**是否真正建立回路要看 `measure`
+行**；`change` 行的 `steps=` 给出转向延迟；M 的 inject 行额外带 `futile=N`。
+
+面板位于 **设置 → better-debug**（或 `http://<web-origin>/better-debug`），只读、
+5 秒自刷新，展示触发分布、覆盖会话、提示后首个动作、测量回路、窗口内转向率与
+中位步数、方案层阈值与 futile 累计。两项措辞纪律需要说明：
+
+- 「提示后首个动作」是**描述性统计**，不证明提醒促成了改变；「换动作率」这类
+  因果暗示的指标名已弃用。
+- 早于埋点的旧日志没有分母，转向率显示为「这段日志早于 v0.2 埋点」而非 0%；
+  老日志缺少方案层字段时显示 `—`，不编造默认值。面板不估算「节省的 token」，
+  要证明增益需要对照组或历史回放，两者均不在其职责内。
+
+`panel: false` 可关闭路由，不影响闸门。
+
+## 自带技能
+
+`assets/stuck-gate/SKILL.md` 注册为 bundled 技能（rank 600），注入文本末尾的
+「完整五条」即指此文件。它负责提示词层的五步法（建回路、搜索、最小化、可证伪假设、
+换层），与插件相互独立：插件负责「想不起来的那一刻」，技能负责「想起来后做什么」。
+
+用户可在 `~/.dsh/skills/stuck-gate/SKILL.md`（rank 400）放同名文件覆盖默认文案，
+数值小者优先，无需修改代码。宿主无 `skills` 服务时注册跳过并记日志，闸门不受影响。
 
 ## 本地验证
 
 ```bash
-node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js
-node test/sim.mjs           # 46 个用例：闸门语义 + 可移植性
-node test/panel.mjs         # 48 个用例：日志解析、聚合、世代判定、亮暗配色、埋点落盘（慢盘轮多 1 条自检，49）
-npm run test:posix          # 把上面两套用 POSIX 路径语义再跑一遍
-npm run test:linux          # 再把上面两套用 Linux 平台语义（不折叠大小写）跑一遍
-npm run test:slow           # 把落盘拖慢 400ms，验证「等条件读日志」而不是等时长
-npm run verify              # 上面全部（含语法检查）
+node test/sim.mjs           # 65 个用例：闸门语义与可移植性
+node test/panel.mjs         # 62 个用例：日志解析、聚合、世代判定、配色、埋点
+npm run test:posix          # 以 POSIX 路径语义重跑上述两套
+npm run test:linux          # 以 Linux 平台语义（区分大小写）重跑
+npm run test:slow           # 落盘延迟 400ms，验证「等条件」而非「等时长」（63 条）
+npm run verify              # 全部（含语法检查）
 ```
 
-`test/sim.mjs` 用假 ctx 复刻 agent-loop 的调用顺序（`emitPlain` / `emitWaterfall`），
-覆盖 **46 个用例**。
+测试以假 ctx 复刻 agent-loop 的调用顺序，**不依赖 DSH 运行时**。每条信号均有正例
+与反例：测量两态、episode 归属、C 的两段式、重新武装、交付态、F 的族判定与 B 抑制、
+O 的交替振荡/健康 TDD/flaky、P 的链计数与重跑排除、M 的触发/独立性/开关。
 
-语义层（每条都有正例 + 反例）：
+三轮附加测试对应三类「本机通过、真机失败」的回归防线：
 
-- **测量意图 / 结果两态**：`edit → ls → edit → edit` 仍触发；只 call 不 result 不清零；
-  失败的测试不算盲改；无关目录的测量不清目标文件的计数。
-- **B 的 episode**：同目标同指纹才累计；两个不同文件各错一次 ENOENT 不触发；
-  episode 之后搜过才免疫（先搜过别的问题不免疫）。
-- **C 的两段式**：改完只在读东西不打断；上膛后又动手才开口。
-- **重新武装**：A 提醒 → 有效测量恢复 → 新阶段再盲改允许第二次；受每 turn 预算约束。
-- **交付态**：`present` 成功后不注入；**`present` 失败不休眠**。
-- 措辞只陈述观察、锁文件不计入、D 段静音、子会话跳过、阈值可调、
-  `decayEditsOnVerify: false` 反例可回滚、`enabled: false`、自带技能注册与正文去私有化、
-  宿主无 `skills` 服务不抛、导出形状，以及 13 项分类/判据/指纹单测。
+- **路径方言**：`node:path` 的 `isAbsolute` 平台相关，曾导致 POSIX 宿主上写入被静默
+  丢弃。`test:posix` 用 resolve hook 替换为 `node:path/posix` 后原样重跑。
+- **大小写敏感**：`test:linux` 覆盖 `process.platform`，断言以 `samePath`/`sameDirs`
+  按平台比较，避免把本机折叠语义写进期望值。
+- **落盘时序**：插件刻意 `void record(...)` 不 await，`test:slow` 将 `appendFile`
+  拖慢 400ms，任何固定 sleep 的读日志写法都会稳定失败；读取一律等条件。
 
-**不依赖 DSH 运行时**，改动后先跑它。
+CI 在 ubuntu / windows / macos × node 20 / 22 / 24 上运行 `npm run verify`。
 
-### 为什么有 `test:posix` 与 `test:linux` 两轮
+## 设计依据与相关工作
 
-`test/sim.mjs` 里的路径全是 `C:/work/...` 这种 Windows 方言。它在一台 Linux 机器上照样
-能跑，但跑的是**另一套语义**——这正是 v0.2 之前的一个真事故：
+插件不实现任何规划算法，其概念划分与以下文献一致，判据均为可复现的事件启发式：
 
-`node:path` 的 `isAbsolute` 是平台相关的，`isAbsolute('C:/work/a.js')` 在 Linux/macOS 上
-返回 `false`。入口闸用它筛写入路径，于是那些机器上**所有写入被静默丢弃**，A / C 两个信号
-完全不工作，而 Windows 开发机上一片绿。修法是不再问操作系统「这个根像不像我」，只问
-「它是不是从根开始的」（`isAbsPath`）。
-
-`test/posix` 用 `node --import` 的 resolve hook 把 `node:path` 换成 `node:path/posix`，
-然后**把两套用例原样再跑一遍**——这样 Windows 开发机也能复现 Linux 的路径语义。CI 在
-ubuntu / windows / macos × node 20 / 22 / 24 上跑 `npm run verify`，所以这条不会退回去。
-（24 不是凑数：桌面版 DSH 跑的是 Electron 内置的 node 24。）
-
-`test:linux` 补的是另一根轴。`test:posix` 只换 `node:path`，**不伪造 `process.platform`**，
-所以那一轮里 `CASE_INSENSITIVE` 仍然是 `true`。大小写折叠这条分支因此在本机永远不执行——
-直到 2026-11-14，真机 ubuntu CI 把 v0.2.2 的两组新断言打红：期望值写死成小写
-（`c:/users/u/...`、`['/home/u/projb']`），而 Linux 上路径区分大小写、原样保留大小写。
-根因不在被测代码，在**断言本身也沾了本机平台**——它测的是「Windows 上通过」。
-
-`test/linux/register.mjs` 只把 `process.platform` 覆盖成 `linux`（它是 getter，必须
-`Object.defineProperty`；直接赋值会被静默忽略），不碰 path 模块。两轴分开之后，
-「path 方言 × 大小写敏感」四种组合里有三种能在 Windows 开发机上跑到，剩下的
-Linux + posix 由 CI 补。断言里因此不再写死某种大小写，而是用 `samePath` / `sameDirs`
-按平台比较，期望值用**原始大小写**书写（`C:/Users/u/...`、`/home/u/projB`）。
-
-### 为什么有 `test:slow` 这一轮
-
-第三类「本机绿、真机红」不是平台语义，是**时序**。插件写日志用的是
-`void record(...)`——刻意不 `await`，因为不能因为写一行日志就拖慢 agent 每一步。
-代价是：测试读回日志时，「写完了没有」永远是个竞态。
-
-2026-11-14 的真机 CI（`windows-latest` + node 24）正是这样红的：`inject` / `outcome` /
-`change` 三行都落盘了，`measure` 还在队列里，断言报 `no measure line`——看起来像埋点坏了，
-其实只是**读早了**。修法不是把 `sleep` 从 120ms 加到 500ms（那只是把骰子换个面），
-而是把「等时长」换成「等条件」：`readLogWhenReady()` 每 10ms 读一次，直到目标行型齐全，
-超时则把**缺哪一行**打印出来，让失败信息指向真正的缺口。
-
-`test/slow` 把那个时序放大到必然发生：`registerHooks` 把 `node:fs/promises` 换成
-`appendFile` 慢 400ms 的替身（`BD_SLOW_MS` 可调）。于是任何「等固定时长」的写法都会
-稳定红，而「等条件」的写法不管慢多少都绿。这是回归防线，不是性能测试。
-`node < 22.15` 没有 `registerHooks`，这一轮自动跳过——与 `test:posix` 的两通道策略一致。
-
-同一类问题的其余各处，都在 v0.2 / v0.2.1 / v0.2.2 / v0.2.3 / v0.2.4 / v0.2.5 / v0.2.6 修掉了：
-
-| 症状 | 根因 | 现在 |
-| --- | --- | --- |
-| Linux/macOS 上闸门完全不响 | `isAbsolute` 平台相关 | `isAbsPath` 两种方言都认 |
-| 装完面板四张卡全 0 | 默认 `logFile: ""` 不落盘 | 默认落 `$DSH_HOME/logs/better-debug.log` |
-| 插件静默不加载，无报错无日志 | 静态 `inject: ['skills']` 缺服务时 `apply()` 整个不执行 | `inject = []`，走 `ctx.inject` 动态订阅 |
-| 市场点「启用」没反应 | bundle patch 带 `config:` 块 | patch 只留 `id` + `name` |
-| 宿主版本太旧也不拦 | 版本范围写在 `dsh.engines.dsh`，而宿主与市场只读顶层 `engines.dsh` | 移到顶层 `engines.dsh` |
-| 新项目里一报错就误报「同一个操作重复报错」 | node 的栈是 `file:///C:/...`，路径正则先撞上 scheme 里的 `e:`，每份栈都变成 `"e:///c"` | `stripFileUrl` 先剥 URL 头 |
-| `a1.js` 与 `a2.js` 被当成同一处 | 归一化把路径里每个数字都换成 `<n>`，只该剥行号列号 | 只剥末尾 `(:\d+)+$` |
-| 在兄弟目录跑测试，把这个目录的盲改计数洗白了 | `measureDirs` 把 `cd <dir>` 当文件取父目录（`cd ~/projB` → `~`） | 认 `cd` 形式，那段路径按目录处理 |
-| 面板永远红着脸说「插件当前被关闭」，而它明明在跑 | 横幅数的是**整份日志**里的 `disabled` / `panel failed`，历史里挂过一次就永久算「现在坏了」 | 横幅只认最后一次 `apply` 之后（`log.current`），历史单独的个数写在页脚 |
-| 新加的用例在 Windows 上全绿，真机 Linux CI 全红 | 断言把 `CASE_INSENSITIVE` 的折叠结果写死了；`test:posix` 只换 `node:path`、不伪造 `platform`，那条分支本机永不执行 | `test:linux` 轮覆盖 `process.platform`，断言改用 `samePath` 按平台比 |
-| 同一份用例在本机 40/40，`windows-latest` + node 24 上 38/40 | 测试用固定 `sleep` 等日志落盘；插件刻意 `void record(...)` 不 `await`，慢盘上 `measure` 行还没写完就读了 | 读日志改成等条件（`readLogWhenReady`），并新增 `test:slow` 把落盘拖慢 400ms 当回归防线 |
-| 亮色模式下整块面板还是黑的 | 面板跑在 iframe 里，引用的 `--dsw-alias-text-primary` / `-bg-elevated` / `-border-subtle` 在宿主里根本不存在（宿主的叫 `label-*` / `bg-layer-*` / `border-l*`），而 CSS 自定义属性又不跨 iframe 继承 → 每条都落回硬编码的深色回退值 | 面板自带亮/暗两套调色板，由 `<html data-bd-scheme>` 选；属性由 head 里同步执行的小脚本设置，先问宿主的 `data-ds-dark-theme` / `color-scheme`，读不到才退回系统偏好 |
-
-**大小写折叠按平台判**（`CASE_INSENSITIVE`）：只在 `win32` / `darwin` 上折叠。折叠错了的
-后果不对称——该折叠却不折叠是漏报，不该折叠却折叠是**误报**（狼来了），后者才是这道闸门
-最不能犯的错。macOS 上装了区分大小写的 APFS 会少报一点，仍然是安全方向。
-
-`test/panel.mjs` 覆盖 **48 个用例**（慢盘轮 49 条：多的是那条「替身确实被用到」的自检——hook 没生效时它会红，避免整轮在测空气）：带引号与转义的字段切分、六种行型解析（`inject` / `outcome` /
-`change` / `measure` / `arm` / `panel-failed`）、`charsFor` 与真实文案长度零漂移（6 组信号组合）、
-`worstStreak` 在日志→解析→聚合→面板全链路保留、`suppress` 与 `arm` 行可解析且不计入触发、
-聚合出的 `firstAction` / `turned` / `measures`、**断言 v0.1 的旧字段名
-`changed` / `changedRate` / `outcomes` 不得复活**、阈值取最后一条 `apply`、空日志与坏行不抛，
-以及端到端——真跑 `apply()` 走完一个 turn，读回日志断言 `inject` 带 `inj=`、
-`outcome` 带 `before=write`、`measure ok=false exit=1`、`change` 行都写了且被聚合。
-
-世代判定单列一组：历史里有失败、最后一次 `apply` 之后干净 → `log.current` 全 0、横幅不亮；
-`apply` 之后又失败 → `log.current` 必须亮；日志里根本没有 `apply` 行 → `markers=0`，
-面板明说「读到的只是片段」，不冒充健康。**页面本身也被断言**——直接读 `web/index.html`，
-确认横幅读的是 `log.current`、没有残留按全量计数判红的老分支。
-
-亮暗配色也单列一组（同样直接读页面源码）：两套调色板都在、关键变量两边都定义、背景与正文色
-真的不同（空的 vs 空的会被算成相同）、亮色是深字浅底而暗色是浅字深底（对比度方向不许反）、
-不再引用任何宿主变量、样式规则区没有裸颜色字面量（全走变量）、两套都声明 `color-scheme`、
-主题属性的取值域只有 `light` / `dark`，以及那个脚本读的是**宿主文档**（`data-ds-dark-theme`）
-而不是自己的 —— 后者正是 iframe 继承断裂的根因，写错就退化成「只跟系统走」。
-
-## 已知边界
-
-- 「同一文件」按**绝对路径**判定。删了重建同名文件也算同一处——这通常是对的（说明在同一个
-  概念上打转），但如果只是反复改生成文件，用 `excludePaths` 排掉或把 `repeatEditThreshold` 调大。
-- **测量判据是启发式的**：`ops_bash` 跑的是不是真测量，靠 `measureCommands` / `measureIntent`
-  两个正则猜。猜错的代价现在是不对称的——把非测量当测量会漏报，把测量当非测量会误报。
-  默认清单偏向「宁可误报也不漏报」，因为你看到提醒后自己判断的成本很低。
-- `done-state` 认的是**成功返回的** `present` 调用，不是「模型说了一句收尾话」。纯文本终稿靠
-  `stuck-gate` 技能的 done-state 自检兜底；若某类任务从不调 `present`，
-  把 `doneOnPresent: false` 关掉更省心。
-- 只在**主会话**生效。多 agent 场景下每个 subagent 各自打转不会被拦——但它们的产物最终
-  汇到 lead，lead 这边的计数仍然有效。
-- 面板是**只读的日志视图**，不是监控：它不写任何数据，也不改变闸门判定。只有显式写
-  `logFile: ""` 关掉落盘时，面板才会只剩「没有数据」，一切统计为 0。
-- `firstAction` 的分母是「已被观察到的注入」。注入后 turn 直接结束（没有后续 `tool/call`）
-  不计入，样本少时波动很大——看量级，别当 KPI。
+- **计划修复与重规划**：Nebel & Koehler（IJCAI 1995）证明复用旧计划在最坏情况下
+  不优于重新规划；Fox 等（ICAPS 2006）提出 plan stability 并实证比较两种策略。
+  本插件的 P（补丁链）对应「修复次数累积后应转向重建」的维护规则，arXiv:2611.19663
+  将其形式化为 patch debt 与 commitment hysteresis；M 对应「同类修订工具失效后
+  应切换修订层级」。
+- **元认知监控**：自我监测在压力下失效是引入外部监控的动机；插件充当 harness 层的
+  外部元认知——检测不依赖模型自觉，干预也先于下一步动作而非事后复盘。
 
 ## License
 

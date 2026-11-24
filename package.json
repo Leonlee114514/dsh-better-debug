@@ -1,7 +1,7 @@
 {
   "name": "dsh-better-debug",
-  "version": "0.2.6",
-  "description": "卡住闸门的代码化：同一文件连续盲改 / 同一操作重复报错 / 改完没有回路又动手，命中就在下一步注入一次提醒，逼出一条几秒能跑的反馈回路。",
+  "version": "0.3.0",
+  "description": "面向编码场景的卡住检测：以事件流中的行为证据（盲改 / 重复报错 / 错误族 / 验证振荡 / 补丁链 / 干预失效）在下一步前注入观察与恢复建议。不读模型文本、不调 LLM 的 DeepSeek Harness 插件。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
