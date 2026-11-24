@@ -71,9 +71,9 @@ layer detects **changing actions with an unchanged direction**; the meta layer d
 | Tactical | **A** blind edits | `fs/write-intent` count per absolute path, cleared per directory when a measurement result arrives | **3** in a row |
 | Tactical | **B** repeated error | Episode keyed by `tool\|target\|error fingerprint`; immunized by a search after the episode | **2**nd occurrence |
 | Tactical | **C** edit without verification | N steps after a write with no measurement arms the gate; the **next write** fires it | **2** steps |
-| Strategy | **F** error family | Distinct fingerprints and total count under one `tool\|target`; immunized by a search after the family | **3** fingerprints and **4** total |
-| Strategy | **O** oscillation | Within one measurement loop, a **previously-green failure recurs** (recent set, capacity 4), with a write between the two results | **3**rd flip |
-| Strategy | **P** patch chain | Consecutive "measurement failed → write → measurement still fails"; cleared by a successful measurement | **3** rounds |
+| Strategy | **F** error family | Distinct fingerprints and total count under one `tool\|target`; a search only immunizes the fingerprints that existed before it | **3** fingerprints and **4** total |
+| Strategy | **O** oscillation | Within one measurement loop, a **previously-green failure recurs** (recent set, capacity 4), with a write between the two results; muting is per loop | **3**rd flip |
+| Strategy | **P** patch chain | Consecutive "measurement failed → write → measurement still fails" **without the failure surface shrinking** (smaller set = converging, identical set = no progress, a different file = the next site); cleared by a successful measurement | **3** rounds |
 | Meta | **M** intervention failure | An injection whose window closes with no measurement/search is counted into `futile` | **2** futile injections |
 
 All signals share one primitive — **measurement**, not "some tool was called".
@@ -172,9 +172,9 @@ Signals never restate the same situation twice in one step:
 | A | A measurement result arrives (clears related directories only) |
 | B | A search occurs after the episode |
 | C | A measurement result arrives (disarms the gate) |
-| F | A search, or a successful measurement |
-| O | Two consecutive successes in the same loop |
-| P | A successful measurement |
+| F | A search (only for fingerprints predating it), or a successful measurement |
+| O | Two consecutive successes in the same loop (re-arms that loop only) |
+| P | A successful measurement, or the failure surface starting to shrink |
 | M | Once per turn; genuine turns reset `futile` |
 
 - Tactical and strategy signals share the per-turn budget `maxInjectsPerTurn` (default 3).
@@ -227,6 +227,17 @@ Further limits:
   `stuck-gate` skill's self-check. Set `doneOnPresent: false` for tasks that never call it;
 - All state lives **within a turn** and resets at `turn/start`; nothing persists across turns;
 - No-op writes are not detected: `fs/write-intent` carries no content, so no diff is available;
+- P's "failure surface" is counted as `target|fingerprint`, and the fingerprint only covers
+  the first 6 lines with numbers folded to `<n>`. Two shapes are therefore indistinguishable:
+  10 errors down to 6 (first 6 lines unchanged) vs. nothing changed, and `expected 2 got 1`
+  vs. `got 1.5`. Both read as "did not shrink", which would make P fire more often — except
+  the "moved to a different file" rule below pushes the net direction back to under-reporting;
+- P prefers to under-report: an error that moves to a **different file** always counts as
+  progress (fixing separate files must not be called a patch chain). The cost is that a real
+  chain pushing the error from A into B also goes unmentioned;
+- F needs an extractable path. Without one (plain-text errors, only `[exit code: 1]`) the
+  failure keeps B's bookkeeping but never joins an error family — better silent than merging
+  errors from unrelated projects into one target;
 - End-of-turn probe cleanup belongs to `dsh-turn-cleanup`, not this plugin.
 
 ## Installation
@@ -240,7 +251,7 @@ dsh plugin add dsh-better-debug
 From the release tarball (byte-identical to the npm package):
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.0/dsh-better-debug-0.3.0.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.1/dsh-better-debug-0.3.1.tgz
 ```
 
 Manual link (for local development):
@@ -378,7 +389,7 @@ registration is skipped with a log line and the gate is unaffected.
 ## Local verification
 
 ```bash
-node test/sim.mjs           # 65 cases: gate semantics and portability
+node test/sim.mjs           # 73 cases: gate semantics and portability
 node test/panel.mjs         # 62 cases: parsing, aggregation, generation tracking, themes, instrumentation
 npm run test:posix          # rerun both suites under POSIX path semantics
 npm run test:linux          # rerun under Linux platform semantics (case-sensitive)
@@ -391,6 +402,21 @@ runtime**. Every signal has positive and negative cases: two-phase measurement, 
 attribution, C's two-stage arming, re-arming, done-state, F's family rule and B suppression,
 O's alternating oscillation / healthy TDD / flaky runs, P's chain counting and re-run
 exclusion, M's triggering, independence, and kill switch.
+
+A fourth class of fence covers **over-fitted criteria** — the first three are caught by real
+CI, this one is not, because the criterion itself is wrong rather than the environment:
+
+- **P's three healthy shapes**: a converging sweep (10→9→8→7), the identical error unchanged,
+  and fixing separate files one by one (the site moves). 0.3.0 only compared write sequence
+  numbers and flagged all three;
+- **`errorTargetOf` dialect matrix**: tsc parenthesized locations, cargo, pytest, go, mypy,
+  webpack, C# backslash paths, and Windows backslash-relative paths — 13 spellings in total,
+  plus noise like `7/8 and/or TCP/IP` that must not read as a path;
+- **O's muting granularity**: another loop turning green must not un-mute this one;
+- **F's immunity range**: after a search, brand-new fingerprints on the same target still fire.
+
+All seven negative cases are red on 0.3.0 (`66/73`) and green after the fix (`73/73`) — a
+test has to prove the old code wrong before it is allowed to prove the new one right.
 
 The three extra suites are regression fences for three classes of "green locally, red in
 production":

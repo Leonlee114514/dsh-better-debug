@@ -174,6 +174,10 @@ const fail = (id, text, toolName = 'ops_read_files') =>
 
 const has = (injected, needle) => injected.find((entry) => entry.texts.some((t) => t.includes(needle)))
 
+/** 注入摘要：`step:信号` 列表，比光看条数更容易定位是哪个信号说的话。 */
+const injections = (injected) =>
+  injected.length === 0 ? 'none' : injected.map((entry) => `step${entry.step}`).join(',')
+
 // ── 1. A 信号：同一文件改 3 次，第 4 步注入
 {
   const ctx = makeCtx()
@@ -1331,6 +1335,190 @@ check(
     injected.every((entry) => entry.texts.every((t) => !t.includes('元观察'))),
     `injections=${injected.length}`
   )
+}
+
+// ── 42–48. 0.3.0 评审的四条缺陷（每条都有在 0.3.0 上会红的形状）
+//
+// 共同点：这四条都**不是**本机平台差异，而是判据本身写错了。它们之所以在 0.3.0
+// 的 65 条用例下全绿，是因为旧用例只构造了「该响」的形状，没构造「不该响」的形状 ——
+// 与 0.2.2 那两次真机 CI 红是同一类问题（断言/用例自己拟合了开发者的习惯）。
+
+// ── 42. P 反例：收敛中的清扫（10 → 9 → 8 → 7 个错）不得算补丁链
+//
+// 0.3.0 的判据只比写入序号，于是「每轮都变少」也被算成「每轮修出下一个失败」。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const lint = (n) =>
+    `${Array.from({ length: n }, (_, i) => `src/f${i}.js:${i + 1}:5  error  'v${i}' is defined but never used  no-unused-vars`).join('\n')}\n\n✖ ${n} problems (${n} errors, 0 warnings)\n[exit code: 1]`
+  const steps = [10, 9, 8, 7].map((n, i) => [
+    (s, c) => edit('/work/src/f0.js')(s, c),
+    (s, c) => runFail(`lint${i}`, lint(n), { command: 'npm run lint' })(s, c)
+  ])
+  steps.push([])
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('P 反例：失败面在收缩（10→9→8→7）不得注入', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 43. P 反例：同一个错完全没变（改的是别的文件）不得说「修出了下一个失败」
+//
+// 0.3.0 在这里的文案与事实正好相反：错一个字都没变，却说「每一轮都修出了下一个失败」。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const same = 'TypeError: Cannot read properties of undefined (reading \'x\')\n    at C:/work/src/a.js:9:3\n[exit code: 1]'
+  const steps = [
+    [(s, c) => edit('/work/src/x.js')(s, c), (s, c) => runFail('same1', same)(s, c)],
+    [(s, c) => edit('/work/src/y.js')(s, c), (s, c) => runFail('same2', same)(s, c)],
+    [(s, c) => edit('/work/src/z.js')(s, c), (s, c) => runFail('same3', same)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('P 反例：同一个错三连（一字未变）不得注入', injected.length === 0, `injections=${injected.length}`)
+}
+
+// ── 44. P 反例：逐个修**不同文件**的单条错误 = 换现场，不是补丁链
+//
+// 集合大小恒为 1、只有路径在换。0.3.0 与「只比集合大小」的中间版本都把它判成补丁链；
+// 判据里必须有「换现场直接归零」这一条（宁可漏判，也不要把分头修好说成打转）。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const rows = [
+    ['src/m1.ts', 2322, 'Type string is not assignable to type number'],
+    ['src/m2.ts', 2304, "Cannot find name 'foo'"],
+    ['src/m3.ts', 2339, "Property 'x' does not exist"],
+    ['src/m4.ts', 2554, 'Expected 2 arguments, but got 1']
+  ]
+  const steps = rows.map(([file, code, message], i) => [
+    (s, c) => edit(`/work/${file}`)(s, c),
+    (s, c) => runFail(`tsc${i}`, `${file}(10,9): error TS${code}: ${message}\n[exit code: 2]`, { command: 'npx tsc --noEmit' })(s, c)
+  ])
+  steps.push([])
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('P 反例：逐个修独立文件（换现场）不得注入', injected.length === 0, `injections=${injections(injected)}`)
+}
+
+// ── 45. F 反例：四个不同项目、抽不出目标的 tsc 错误不得塌进同一族
+//
+// 0.3.0 的 errorTargetOf 只认 V8 栈，tsc 的 `src/a.ts(12,9)` 返回空串 →
+// familyKey 全变成 `ops_read_files|`，四个无关项目被算成「同一个目标上换了四种报错」。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const rows = [
+    "projA/src/a.ts(1,1): error TS2304: Cannot find name 'foo'.",
+    "projB/src/b.ts(2,1): error TS2339: Property 'x' does not exist.",
+    'projC/src/c.ts(3,1): error TS2554: Expected 2 arguments, but got 1.',
+    "projD/src/d.ts(4,1): error TS1005: ';' expected."
+  ]
+  const steps = rows.map((text, i) => [
+    (s, c) => edit('/work/src/a.js')(s, c),
+    (s, c) => fail(`fam${i}`, text)(s, c)
+  ])
+  steps.push([])
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '种不同报错')
+  check('F 反例：四个无关项目的报错不得算作同一目标', hit === void 0, `injections=${injections(injected)}`)
+}
+
+// ── 46. errorTargetOf 必须认 ≥8 种真实编译器的报错位置写法
+//
+// 这条是「不要过拟合本机环境」的直接落点：旧用例里只有 V8 栈一种格式，
+// 换编译器（tsc / cargo / pytest / go / mypy / webpack）就全哑。
+{
+  const rows = [
+    ['tsc 相对路径（括号行号）', 'src/a.ts(12,9): error TS2322: Type string is not assignable', 'src/a.ts'],
+    ['tsc 绝对路径', 'C:/repo/src/a.ts(12,9): error TS2322: x', 'C:/repo/src/a.ts'],
+    ['C# 反斜杠路径', 'C:\\repo\\src\\a.cs(12,9): error CS0103: y', 'C:/repo/src/a.cs'],
+    ['cargo', 'src/main.rs:12:9: error[E0308]: mismatched types', 'src/main.rs'],
+    ['pytest', 'tests/test_a.py::test_foo FAILED', 'tests/test_a.py'],
+    ['go', './main.go:12:5: undefined: Foo', './main.go'],
+    ['python 绝对路径', '/home/u/repo/src/a.py:12: error: bad', '/home/u/repo/src/a.py'],
+    ['webpack', 'ERROR in ./src/index.js 5:0-20', './src/index.js'],
+    ['mypy', 'src/app/main.py:3: error: Incompatible return value', 'src/app/main.py'],
+    ['V8 栈（file:/// URL）', '    at parse (file:///C:/work/src/a.mjs:12:29)', 'C:/work/src/a.mjs'],
+    // Windows 上的编译器用的是反斜杠。相对路径这一支（REL_SOURCE）如果只认 `/`，
+    // 那么在 Windows 上跑 tsc / cargo / pytest 时目标全是空串 —— 与 0.3.0 的
+    // 「抽不出目标就整族塌陷」是同一个后果，只是换了触发条件。
+    ['tsc 反斜杠相对路径', 'src\\lib\\a.ts(12,9): error TS2322: x', 'src/lib/a.ts'],
+    ['cargo 反斜杠相对路径', 'src\\main.rs:12:9: error[E0308]', 'src/main.rs'],
+    ['pytest 反斜杠相对路径', 'tests\\test_a.py::test_foo FAILED', 'tests/test_a.py']
+  ]
+  const bad = rows.filter(([, text, expected]) => !samePath(errorTargetOf(text), expected))
+  check(
+    'errorTargetOf: 13 种编译器写法都能抽出路径',
+    bad.length === 0,
+    bad.map(([label, text]) => `${label}→${JSON.stringify(errorTargetOf(text))}`).join(', ') || 'all ok'
+  )
+  // 反向：不是路径的东西不能被当成路径。`7/8`、`and/or`、`TCP/IP` 都是真出现过的噪声。
+  check(
+    'errorTargetOf: 分数 / 连词 / 缩写不误判成路径',
+    errorTargetOf('7/8 and/or TCP/IP 12/25').length === 0,
+    JSON.stringify(errorTargetOf('7/8 and/or TCP/IP 12/25'))
+  )
+}
+
+// ── 47. O 反例：另一条回路变绿，不得解除这条回路的静音
+//
+// 0.3.0 清的是**全局** fired.O，于是任何新命令首次 ok（flips 天然是 0）都会把别人的
+// 静音解除 —— 同一局面在 step 8 说一次，夹两条 `npm run lint` 的成功之后再在 step 12
+// 说一次，两次文案逐字相同。静音必须属于「这一条回路」。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const red = 'AssertionError: expected 3 to be 4\n    at C:/work/test/a.test.mjs:12:29\n[exit code: 1]'
+  const file = '/work/src/a.js'
+  const steps = []
+  // 三轮「红 → 绿」：flips 走到 3
+  for (let i = 0; i < 3; i += 1) {
+    steps.push([(s, c) => edit(file)(s, c), (s, c) => runFail(`r${i}`, red)(s, c)])
+    steps.push([(s, c) => edit(file)(s, c), (s, c) => measure(`g${i}`)(s, c)])
+  }
+  steps.push([(s, c) => edit(file)(s, c), (s, c) => runFail('r9', red)(s, c)]) // 第 7 步：flips 到 3
+  steps.push([]) // 第 8 步 pre-step：第一次开口
+  // 另一条全新回路连续两次成功 —— 0.3.0 会在这里把全局 fired.O 清零
+  steps.push([(s, c) => edit(file)(s, c), (s, c) => measure('l1', { command: 'npm run lint' })(s, c)])
+  steps.push([(s, c) => edit(file)(s, c), (s, c) => measure('l2', { command: 'npm run lint' })(s, c)])
+  steps.push([(s, c) => edit(file)(s, c), (s, c) => runFail('r10', red)(s, c)]) // 第 11 步：flips 到 4
+  steps.push([]) // 第 12 步：必须已经静音
+  steps.push([])
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hits = injected.filter((entry) => entry.texts.some((t) => t.includes('翻转了')))
+  check(
+    'O 反例：另一条回路变绿不得解除这条回路的静音',
+    hits.length === 1,
+    `O 注入 ${hits.length} 次（step ${hits.map((h) => h.step).join(',') || '-'}）`
+  )
+}
+
+// ── 48. F 正例：搜索之后，同一目标又堆出全新指纹，必须还能响
+//
+// 0.3.0 比的是族的 firstClock，一次搜索就把这一族**终生**免责 —— 与 F 想抓的
+// 「改来改去只换来下一个错」正好相反。改成比 lastNewClock（最近一次真的换了个新错）。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const at = (msg) => `${msg}\n    at parse (file:///C:/work/src/a.mjs:12:29)`
+  const steps = [
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => fail('s1', at('TypeError: alpha is not a function'))(s, c)],
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => fail('s2', at('RangeError: beta out of bounds'))(s, c)],
+    [(s, c) => tool('s3', 'web_search', { args: { query: 'TypeError alpha' }, text: 'ok' })(s, c)],
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => fail('s4', at('SyntaxError: gamma unexpected token'))(s, c)],
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => fail('s5', at('EvalError: delta violated'))(s, c)],
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => fail('s6', at('URIError: epsilon malformed'))(s, c)],
+    [(s, c) => edit('/work/src/a.js')(s, c), (s, c) => fail('s7', at('ReferenceError: zeta not defined'))(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '种不同报错')
+  check('F: 搜索之后同一目标的新指纹仍能触发（免疫不是终生的）', hit !== void 0, `injections=${injections(injected)}`)
 }
 
 // ── 29. 导出形状
