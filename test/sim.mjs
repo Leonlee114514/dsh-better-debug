@@ -1376,7 +1376,23 @@ check(
     []
   ]
   const injected = await runTurn(ctx, agent, { turn: 1, steps })
-  check('P 反例：同一个错三连（一字未变）不得注入', injected.length === 0, `injections=${injected.length}`)
+  // 这里**不能**断言「总注入为 0」。
+  //
+  // 「同一个失败一字未变地重复三轮」确实不是补丁链（P 不该说话），但它也不是
+  // 「什么都没发生」——它是「同一个错重复了三次」这个事实本身。0.3.1 把两者混成一条
+  // 断言（总注入 0），于是 P 一旦按规格退出，这一整类局面就变成**所有信号都不说话**：
+  // 实测连续八轮注入 0 次（深审缺陷 1）。规格应该是「P 不说话，但必须有人接管」。
+  check(
+    'P 反例：同一个错三连（一字未变）不得注入 P',
+    !has(injected, '修出了下一个失败'),
+    `signals=${injections(injected)}`
+  )
+  check(
+    'P 反例：同一个错三连必须由「重复失败」接管（不能全沉默）',
+    has(injected, '重复报错'),
+    `signals=${injections(injected)}`
+  )
+  check('P 反例：同一个错三连不夹带 O / F / M', !has(injected, '翻转了') && !has(injected, '种不同报错') && !has(injected, '元观察'), `signals=${injections(injected)}`)
 }
 
 // ── 44. P 反例：逐个修**不同文件**的单条错误 = 换现场，不是补丁链
@@ -1519,6 +1535,98 @@ check(
   const injected = await runTurn(ctx, agent, { turn: 1, steps })
   const hit = has(injected, '种不同报错')
   check('F: 搜索之后同一目标的新指纹仍能触发（免疫不是终生的）', hit !== void 0, `injections=${injections(injected)}`)
+}
+
+// ── 49. B 的搜索基线（深审缺陷 4 的四条验收）
+//
+// 0.3.1 的触发条件是 `s.lastSearchClock > entry.firstClock`，而 firstClock 创建后
+// 永不改变 —— 一次搜索就把这一条 episode **终生**免责：搜索之后同一个错再重复六次
+// 也一条都不响。改成「记下搜索当时的计数，之后只数新攒的次数」。
+//
+// 四条一起测，因为单看任何一条都能用错的方式满足：
+//   · 只测「搜索后 1 次不报」→ 沉默到底也能过；
+//   · 只测「搜索后达阈值要报」→ 搜索后第一次就报也能过。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const boom = 'TypeError: x is not a function'
+  const steps = [
+    [(s, c) => fail('base-1', boom)(s, c)],
+    [(s, c) => tool('base-search', 'web_search', { args: { queries: [boom] } })(s, c)],
+    [(s, c) => fail('base-2', boom)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check(
+    'B 搜索基线：搜索后只再撞 1 次，还不够阈值 → 不报',
+    has(injected, '同一个操作重复报错') === void 0,
+    `signals=${injections(injected)}`
+  )
+}
+
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const boom = 'TypeError: y is not a function'
+  const steps = [
+    [(s, c) => fail('reb-1', boom)(s, c)],
+    [(s, c) => tool('reb-search', 'web_search', { args: { queries: [boom] } })(s, c)],
+    [(s, c) => fail('reb-2', boom)(s, c)],
+    [(s, c) => fail('reb-3', boom)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '同一个操作重复报错')
+  check(
+    'B 搜索基线：搜索后重新攒够 2 次 → 必须报（免疫不是终生的）',
+    hit !== void 0,
+    `signals=${injections(injected)}`
+  )
+}
+
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const boom = 'TypeError: z is not a function'
+  const steps = [
+    [(s, c) => fail('re1', boom)(s, c)],
+    [(s, c) => fail('re2', boom)(s, c)],
+    [(s, c) => tool('re-search', 'web_search', { args: { queries: [boom] } })(s, c)],
+    [(s, c) => fail('re3', boom)(s, c)],
+    [(s, c) => fail('re4', boom)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hits = injected.filter((entry) => entry.texts.some((t) => t.includes('同一个操作重复报错')))
+  check(
+    'B 搜索基线：报过一次之后再搜索、再攒够 → 能再说一次（且不超过两次）',
+    hits.length === 2,
+    `steps=${hits.map((h) => h.step).join(',') || '-'}`
+  )
+}
+
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const boom = 'TypeError: w is not a function'
+  const steps = [
+    [(s, c) => fail('many-0', boom)(s, c)],
+    [(s, c) => tool('many-search', 'web_search', { args: { queries: [boom] } })(s, c)],
+    ...Array.from({ length: 6 }, (_, i) => [(s, c) => fail(`many-${i + 1}`, boom)(s, c)]),
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hits = injected.filter((entry) => entry.texts.some((t) => t.includes('同一个操作重复报错')))
+  // 关键：不能是 0（沉默），也不能是 3（每条重复都各说一次）。
+  check(
+    'B 搜索基线：搜索后连撞 6 次 → 恰好一次，不沉默也不连发',
+    hits.length === 1,
+    `steps=${hits.map((h) => h.step).join(',') || '-'}`
+  )
 }
 
 // ── 29. 导出形状

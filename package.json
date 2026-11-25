@@ -1,6 +1,6 @@
 {
   "name": "dsh-better-debug",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "面向编码场景的卡住检测：以事件流中的行为证据（盲改 / 重复报错 / 错误族 / 验证振荡 / 补丁链 / 干预失效）在下一步前注入观察与恢复建议。不读模型文本、不调 LLM 的 DeepSeek Harness 插件。",
   "type": "module",
   "main": "lib/index.js",

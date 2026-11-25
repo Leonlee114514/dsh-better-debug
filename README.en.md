@@ -69,10 +69,10 @@ layer detects **changing actions with an unchanged direction**; the meta layer d
 | Layer | Signal | Behavioral evidence | Default trigger |
 | --- | --- | --- | --- |
 | Tactical | **A** blind edits | `fs/write-intent` count per absolute path, cleared per directory when a measurement result arrives | **3** in a row |
-| Tactical | **B** repeated error | Episode keyed by `tool\|target\|error fingerprint`; immunized by a search after the episode | **2**nd occurrence |
+| Tactical | **B** repeated error | Episode keyed by `tool\|target\|error fingerprint`, **including `isError:false` measurement failures**; a search records the episode count as a baseline, so repeats must re-accumulate to the threshold | **2**nd occurrence |
 | Tactical | **C** edit without verification | N steps after a write with no measurement arms the gate; the **next write** fires it | **2** steps |
 | Strategy | **F** error family | Distinct fingerprints and total count under one `tool\|target`; a search only immunizes the fingerprints that existed before it | **3** fingerprints and **4** total |
-| Strategy | **O** oscillation | Within one measurement loop, a **previously-green failure recurs** (recent set, capacity 4), with a write between the two results; muting is per loop | **3**rd flip |
+| Strategy | **O** oscillation | Within one measurement loop, a **previously-green failure set recurs** (recent set identities, capacity 4; only failure items, never log noise such as warnings), with a write between the two results; muting is per loop | **3**rd flip |
 | Strategy | **P** patch chain | Consecutive "measurement failed → write → measurement still fails" **without the failure surface shrinking** (smaller set = converging, identical set = no progress, a different file = the next site); cleared by a successful measurement | **3** rounds |
 | Meta | **M** intervention failure | An injection whose window closes with no measurement/search is counted into `futile` | **2** futile injections |
 
@@ -170,11 +170,11 @@ Signals never restate the same situation twice in one step:
 | Signal | Re-arm condition |
 | --- | --- |
 | A | A measurement result arrives (clears related directories only) |
-| B | A search occurs after the episode |
+| B | A search occurs after the episode (the threshold must be re-accumulated afterwards — never a lifetime exemption) |
 | C | A measurement result arrives (disarms the gate) |
 | F | A search (only for fingerprints predating it), or a successful measurement |
 | O | Two consecutive successes in the same loop (re-arms that loop only) |
-| P | A successful measurement, or the failure surface starting to shrink |
+| P | A successful measurement, the failure surface starting to shrink, or the failure set being identical (clears the chain instead of pausing it) |
 | M | Once per turn; genuine turns reset `futile` |
 
 - Tactical and strategy signals share the per-turn budget `maxInjectsPerTurn` (default 3).
@@ -238,6 +238,17 @@ Further limits:
 - F needs an extractable path. Without one (plain-text errors, only `[exit code: 1]`) the
   failure keeps B's bookkeeping but never joins an error family — better silent than merging
   errors from unrelated projects into one target;
+- B now counts two kinds of repetition: `isError:true` tool errors, and `isError:false`
+  **measurement failures** (`npm test` exiting non-zero). The latter never entered error
+  bookkeeping before, so "one identical failure, unchanged, eight rounds in a row" produced
+  no reminder at all on 0.3.1. With that gap closed, B takes over while P stays silent;
+- Repeat episodes only accumulate on **consecutive** failures: `fail → green → same fail` is
+  an oscillation (O's job) and must not be reported as "the same error repeated N times",
+  otherwise both signals fire at once;
+- O decides "the same failure" by failure-item set, not by whole-output text: the same
+  assertion failing with a fresh `Warning: renderer notice-N` line every time is still the
+  same failure, and two genuinely different failures that differ only in unrelated log
+  formatting are not merged;
 - End-of-turn probe cleanup belongs to `dsh-turn-cleanup`, not this plugin.
 
 ## Installation
@@ -251,7 +262,7 @@ dsh plugin add dsh-better-debug
 From the release tarball (byte-identical to the npm package):
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.1/dsh-better-debug-0.3.1.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.2/dsh-better-debug-0.3.2.tgz
 ```
 
 Manual link (for local development):
@@ -389,7 +400,7 @@ registration is skipped with a log line and the gate is unaffected.
 ## Local verification
 
 ```bash
-node test/sim.mjs           # 73 cases: gate semantics and portability
+node test/sim.mjs           # 79 cases: gate semantics and portability
 node test/panel.mjs         # 62 cases: parsing, aggregation, generation tracking, themes, instrumentation
 npm run test:posix          # rerun both suites under POSIX path semantics
 npm run test:linux          # rerun under Linux platform semantics (case-sensitive)
@@ -417,6 +428,32 @@ CI, this one is not, because the criterion itself is wrong rather than the envir
 
 All seven negative cases are red on 0.3.0 (`66/73`) and green after the fix (`73/73`) — a
 test has to prove the old code wrong before it is allowed to prove the new one right.
+
+### Fifth fence: the assertion itself can state the wrong spec
+
+A deep review of 0.3.1 found a subtler failure mode: **the test can enshrine a wrong
+requirement**. The clearest case was the "identical error, unchanged, three times" negative
+case: 0.3.1 asserted *total injections must be zero*. Once P correctly stayed silent, the
+whole shape went completely silent — eight consecutive rounds, zero injections. The correct
+spec is "P must not speak, but something must take over".
+
+The suite now keeps two kinds of assertions apart, each claiming only its own ground:
+
+- **Signal semantics** — assert whether the target signal is present
+  (`!has(injected, '修出了下一个失败')`) and let any other signal take over;
+- **End-to-end coverage** — assert a stuck shape **cannot go fully silent**, and that the
+  same situation **cannot repeat** (the four `B search baseline` cases: any single one is
+  satisfiable by a wrong implementation, only all four pin the semantics down).
+
+Six state-machine fixes correspond to it (0.3.1 → 0.3.2): M moved ahead of the generic
+idempotence early-return (otherwise the one moment it is most needed — "reminded, then no
+writes and no new errors" — is exactly what the idempotence check swallows); failed
+measurements get their own repeat episodes (`isError:false` measurement failures never
+reached `s.errors`); B's search immunity became a count baseline (the old `firstClock`
+exempted an episode forever after one search); P's `unchanged` clears the chain instead of
+pausing it; `movedSite` compares against every target seen this turn (it used to compare
+only with the previous round, so `A→B→A→B` looked like a fresh site every round); O uses
+failure-item set identity (a whole-output fingerprint is rewritten by an unrelated warning).
 
 The three extra suites are regression fences for three classes of "green locally, red in
 production":
