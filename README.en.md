@@ -72,7 +72,7 @@ layer detects **changing actions with an unchanged direction**; the meta layer d
 | Tactical | **B** repeated error | Episode keyed by `tool\|target\|error fingerprint`, **including `isError:false` measurement failures**; a search records the episode count as a baseline, so repeats must re-accumulate to the threshold | **2**nd occurrence |
 | Tactical | **C** edit without verification | N steps after a write with no measurement arms the gate; the **next write** fires it | **2** steps |
 | Strategy | **F** error family | Distinct fingerprints and total count under one `tool\|target`; a search only immunizes the fingerprints that existed before it | **3** fingerprints and **4** total |
-| Strategy | **O** oscillation | Within one measurement loop, a **previously-green failure set recurs** (recent set identities, capacity 4; only failure items, never log noise such as warnings), with a write between the two results; muting is per loop | **3**rd flip |
+| Strategy | **O** oscillation | Within one measurement loop, a **previously-green failure item recurs** (the last 4 failure sets are kept; the current set counts as a recurrence if it **intersects** any of them; only failure items, never log noise such as warnings), with a write between the two results; muting is per loop | **3**rd flip |
 | Strategy | **P** patch chain | Consecutive "measurement failed → write → measurement still fails" **without the failure surface shrinking** (smaller set = converging, identical set = no progress, a different file = the next site); cleared by a successful measurement | **3** rounds |
 | Meta | **M** intervention failure | An injection whose window closes with no measurement/search is counted into `futile` | **2** futile injections |
 
@@ -400,7 +400,7 @@ registration is skipped with a log line and the gate is unaffected.
 ## Local verification
 
 ```bash
-node test/sim.mjs           # 79 cases: gate semantics and portability
+node test/sim.mjs           # 89 cases: gate semantics and portability
 node test/panel.mjs         # 62 cases: parsing, aggregation, generation tracking, themes, instrumentation
 npm run test:posix          # rerun both suites under POSIX path semantics
 npm run test:linux          # rerun under Linux platform semantics (case-sensitive)
@@ -454,6 +454,39 @@ exempted an episode forever after one search); P's `unchanged` clears the chain 
 pausing it; `movedSite` compares against every target seen this turn (it used to compare
 only with the previous round, so `A→B→A→B` looked like a fresh site every round); O uses
 failure-item set identity (a whole-output fingerprint is rewritten by an unrelated warning).
+
+A fourth review then found **four new defects** in 0.3.2, two of which were created by the
+criteria above:
+
+- **Failure identity treated source positions as semantic** (defect 1): the fingerprint was
+  taken over the whole `path + location + message` line with every number kept, so
+  `src/a.ts(12,9)` and `src/a.ts(13,9)` became different failures. The opposite mistake was
+  already proven in 0.3.0/0.3.1 — normalizing every number collapsed `case-1` into `case-2`.
+  The parser now cuts the path **and the locator that immediately follows it**, then
+  fingerprints the rest, so positions are noise and numbers in the message stay semantic;
+- **Python frames were treated as the failure itself** (defect 2): only JS `^at\s` was
+  excluded, so `File "…", line 10, in test_case` joined the set while
+  `AssertionError: case-one` was dropped by the "if any line carries a path, use only those"
+  rule. Two different assertions sharing a frame therefore became the same failure (false
+  "repeated error"), and healthy TDD was read as oscillation. The fix has two halves: frames
+  contribute the target only, and the exception message must be merged in even when path-
+  bearing lines exist. That exposed a third face: the echoed source line under a frame
+  (`    assert case == expected`) is byte-identical across runs and becomes a shared item,
+  so it is recognised structurally and skipped;
+- **O compared whole-set equality instead of item intersection** (defect 3): real sessions
+  rarely replay an identical failure set; far more common is the old failure plus one new
+  one, which made every set hash differ and stayed silent for ten rounds;
+- **Failed measurements did not advance the idempotence state** (defect 4): the generic gate
+  compares only `writeSeq` / `errorSeq`, and "`npm test` failed again" moves neither, so the
+  second reminder in `fail → remind → fail to threshold` was swallowed as "nothing changed".
+  A monotonic `failSeq` now moves on every recorded measurement failure.
+
+Five new case groups (`50`–`53`) cover it: a locator drift must not change identity;
+`case-1` / `case-2` must not merge; different Python assertions sharing a frame must not
+merge; the exception message must stay in the set; the echoed source line must not become a
+shared item; `{A}→{A,B}→{A,C}` must still read as A recurring; and a second B must fire after
+a search once the threshold is reached again. Against 0.3.2 these cases are red 6 of 89;
+after the fixes, `89/89`.
 
 The three extra suites are regression fences for three classes of "green locally, red in
 production":

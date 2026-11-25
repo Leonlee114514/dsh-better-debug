@@ -14,6 +14,8 @@ import {
   measureDirs,
   errorFingerprint,
   errorTargetOf,
+  failureSetOf,
+  failureSetKey,
   exitCodeOf,
   isAbsPath,
   resolveLogFile,
@@ -1625,6 +1627,131 @@ check(
   check(
     'B 搜索基线：搜索后连撞 6 次 → 恰好一次，不沉默也不连发',
     hits.length === 1,
+    `steps=${hits.map((h) => h.step).join(',') || '-'}`
+  )
+}
+
+// ── 50. 失败身份：源位置是噪声，消息里的数字是语义（第二轮深审缺陷 1）
+//
+// 0.3.2 对整行（路径 + 位置 + 消息）取指纹、保留全部数字，于是 `src/a.ts(12,9)` 与
+// `src/a.ts(13,9)` 成了两个不同的失败。但完全相反的做法（把数字全归一成 `<n>`）
+// 在 0.3.0/0.3.1 已经证明会把 `case-1` 与 `case-2` 塌成同一条。两种错都必须挡住，
+// 所以这节只测行为：位置可以漂，消息里的数字不能塌。
+{
+  const tscLine = (line) =>
+    `src/a.ts(${line},9): error TS2322: Type string is not assignable to type number\n[exit code: 2]`
+  const at12 = failureSetOf(tscLine(12))
+  const at13 = failureSetOf(tscLine(13))
+  check(
+    '失败身份：tsc 错误仅行号漂移 → 仍是同一集合（位置是噪声）',
+    failureSetKey(at12) === failureSetKey(at13),
+    `${failureSetKey(at12)} vs ${failureSetKey(at13)}`
+  )
+  // 消息里的数字必须保留：`case-1` 与 `case-2` 是两条不同的失败。
+  const one = failureSetOf('AssertionError: case-1 failed\n    at C:/work/test/a.test.mjs:4:9\n[exit code: 1]')
+  const two = failureSetOf('AssertionError: case-2 failed\n    at C:/work/test/a.test.mjs:4:9\n[exit code: 1]')
+  check(
+    '失败身份：case-1 与 case-2 不得合并成同一条（数字是语义）',
+    failureSetKey(one) !== failureSetKey(two),
+    `${failureSetKey(one)} vs ${failureSetKey(two)}`
+  )
+  // 三步一起看才是完整规格：收缩判定不能被位置漂移打断。
+  const shrink = [tscLine(10), tscLine(11).replace('a.ts', 'a.ts') + '\nsrc/b.ts(3,1): error TS2322: x']
+  check(
+    '失败身份：错误码不变、行号变 → 集合大小不变（不会因漂移看起来像收缩）',
+    failureSetOf(shrink[0]).size === 1 && failureSetOf(shrink[1]).size === 2,
+    `${failureSetOf(shrink[0]).size} vs ${failureSetOf(shrink[1]).size}`
+  )
+}
+
+// ── 51. Python 栈帧不是失败本体（第二轮深审缺陷 2，两个方向相反的误报）
+{
+  const pythonRed = (name, line = 10) =>
+    `Traceback (most recent call last):\n  File "C:/work/test_a.py", line ${line}, in test_case\n    assert case == expected\nAssertionError: ${name}\n[exit code: 1]`
+  const a = failureSetOf(pythonRed('case-one'))
+  const b = failureSetOf(pythonRed('case-two'))
+  check(
+    'Python：不同断言共用同一栈帧 → 集合必须不同（否则被合并成「重复报错」）',
+    failureSetKey(a) !== failureSetKey(b),
+    `${failureSetKey(a)} vs ${failureSetKey(b)}`
+  )
+  // 异常消息必须真的进了集合：把消息行拿掉，集合身份必须变化。
+  // 只断言 size === 1 是弱的 —— 0.3.2 那种「用栈帧顶替消息」的错误实现也满足它。
+  const noMessage = 'Traceback (most recent call last):\n  File "C:/work/test_a.py", line 10, in test_case\n    assert case == expected\n[exit code: 1]'
+  check(
+    'Python：异常消息确实是集合的一部分（拿掉消息行 → 身份变化）',
+    failureSetKey(a) !== failureSetKey(failureSetOf(noMessage)),
+    `${failureSetKey(a)} vs ${failureSetKey(failureSetOf(noMessage))}`
+  )
+  // 集合里只该有**一条**，且源码回显行（逐字相同）不得混进来。
+  check(
+    'Python：集合只含一条（栈帧与源码回显都不进集合）',
+    a.size === 1,
+    `size=${a.size} ${[...a].join(' , ')}`
+  )
+  // 同一个断言、只有栈帧行号漂移 → 仍是同一条失败。
+  const drifted = failureSetOf(pythonRed('case-one', 42))
+  check(
+    'Python：同一断言仅栈帧行号漂移 → 同一集合',
+    failureSetKey(a) === failureSetKey(drifted),
+    `${failureSetKey(a)} vs ${failureSetKey(drifted)}`
+  )
+  // 源码回显行（`    assert case == expected`）逐字相同，绝不能成为公共条目。
+  const echoShared = [...a].filter((item) => b.has(item))
+  check(
+    'Python：源码回显行不得成为两条不同失败的公共条目',
+    echoShared.length === 0,
+    `shared=${echoShared.join(',') || 'none'}`
+  )
+}
+
+// ── 52. O 用条目交集判复发（第二轮深审缺陷 3）
+{
+  const redAt = (file, message) => `AssertionError: ${message}\n    at C:/work/test/${file}.test.mjs:4:9\n[exit code: 1]`
+  const ctxA = makeCtx()
+  apply(ctxA, { logFile: '' })
+  const agentA = { session: makeSession() }
+  const steps = [
+    [(s, c) => edit('C:/work/src/a1.mjs')(s, c), (s, c) => runFail('o-1', redAt('a', 'base'))(s, c)],
+    [(s, c) => measure('o-2')(s, c)],
+    [(s, c) => edit('C:/work/src/a2.mjs')(s, c), (s, c) => runFail('o-3', `${redAt('a', 'base')}\nExtra failure at C:/work/test/b.test.mjs:9:1`)(s, c)],
+    [(s, c) => measure('o-4')(s, c)],
+    [(s, c) => edit('C:/work/src/a3.mjs')(s, c), (s, c) => runFail('o-5', `${redAt('a', 'base')}\nAnother at C:/work/test/c.test.mjs:2:3`)(s, c)],
+    [(s, c) => measure('o-6')(s, c)],
+    [(s, c) => edit('C:/work/src/a4.mjs')(s, c), (s, c) => runFail('o-7', `${redAt('a', 'base')}\nFourth at C:/work/test/d.test.mjs:7:7`)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctxA, agentA, { turn: 1, steps })
+  const flipped = injected.filter((entry) => entry.texts.some((t) => t.includes('翻转了')))
+  check(
+    'O：旧失败 A 每次都伴随一条新失败回来 → 仍要认出 A 在复发',
+    flipped.length >= 1,
+    `steps=${flipped.map((h) => h.step).join(',') || '-'}`
+  )
+}
+
+// ── 53. 失败测量必须推进幂等状态（第二轮深审缺陷 4）
+{
+  // 序列：失败A → 失败A（第一次 B）→ 搜索 → 失败A → 失败A（重新达阈值）→ 下一步
+  // 这一段 writeSeq 与 errorSeq 都没动，只有 failSeq 会变。闸门若只看前两项，
+  // 第二次 B 就被「什么都没变」挡掉（实测只注入 1 次）。
+  const boom = 'AssertionError: expected 3 to be 4\n    at C:/work/test/a.test.mjs:12:29\n[exit code: 1]'
+  const ctxA = makeCtx()
+  apply(ctxA, { logFile: '' })
+  const agentA = { session: makeSession() }
+  const steps = [
+    [(s, c) => runFail('fq-1', boom)(s, c)],
+    [(s, c) => runFail('fq-2', boom)(s, c)],
+    [(s, c) => tool('fq-3', 'web_search', { args: { queries: ['boom'] } })(s, c)],
+    [(s, c) => runFail('fq-4', boom)(s, c)],
+    [(s, c) => runFail('fq-5', boom)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctxA, agentA, { turn: 1, steps })
+  const hits = injected.filter((entry) => entry.texts.some((t) => t.includes('同一个操作重复报错')))
+  check(
+    '失败测量：搜索后重新达阈值 → 第二次 B 不得被幂等闸挡掉（无写入）',
+    hits.length === 2,
     `steps=${hits.map((h) => h.step).join(',') || '-'}`
   )
 }
