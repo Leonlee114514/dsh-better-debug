@@ -105,9 +105,16 @@ The built-in command list covers `npm/pnpm/yarn/bun` with `test|verify|check|lin
 - **Target**: the first path in the error text. Only trailing line/column numbers are
   stripped (`a.mjs:12:29` → `a.mjs`); other digits are kept (`a1.js` and `a2.js` are
   different targets). `file://` prefixes are removed first.
-- **Fingerprint**: the first 6 lines / 300 characters, with hex numbers, paths, and digits
-  normalized, hashed to the first 16 hex digits of sha256. "Same exception, new line number"
-  stays in one episode.
+- **Fingerprint (B / F)**: the first 6 lines / 300 characters, with hex numbers, paths, and
+  digits normalized, hashed to the first 16 hex digits of sha256. "Same exception, new line
+  number" stays in one episode. Folding digits here is deliberate: B asks whether the same
+  operation keeps failing with the same wording, and `expected 2` / `expected 3` are that
+  wording.
+- **Failure-item identity (P / O)**: a separate one. It cuts only the path and the locator
+  right after it and **keeps every digit in the message**. The two must stay apart: B asks
+  "did the wording change", while P asks "did the failure surface turn into a different
+  problem" - folding `case-1` / `case-2` makes P read two different assertions as one error,
+  and failing to strip the locator makes P/O read one edit at one site as a new problem.
 - **B's key** is `tool|target|fingerprint`; **F's key** is `tool|target` (no fingerprint).
   F measures fingerprint **diversity**: `fingerprints.size ≥ 3 ∧ count ≥ 4`. With the
   fingerprint in its key, every new error would open its own episode and F would degenerate
@@ -227,17 +234,29 @@ Further limits:
   `stuck-gate` skill's self-check. Set `doneOnPresent: false` for tasks that never call it;
 - All state lives **within a turn** and resets at `turn/start`; nothing persists across turns;
 - No-op writes are not detected: `fs/write-intent` carries no content, so no diff is available;
-- P's "failure surface" is counted as `target|fingerprint`, and the fingerprint only covers
-  the first 6 lines with numbers folded to `<n>`. Two shapes are therefore indistinguishable:
-  10 errors down to 6 (first 6 lines unchanged) vs. nothing changed, and `expected 2 got 1`
-  vs. `got 1.5`. Both read as "did not shrink", which would make P fire more often — except
-  the "moved to a different file" rule below pushes the net direction back to under-reporting;
+- P's "failure surface" is counted as a **set of failure items** (`target|identity`), and
+  shrinking requires the current set to be a strict subset of the previous one. Identity comes
+  from the message with the path and the locator that follows it cut away, so a line or column
+  drift is not a new failure, while `case-1` / `case-2`, error codes and expected values stay
+  semantic. Two shapes remain indistinguishable: within one file, "10 errors down to 6" and
+  "the first 6 errors, unchanged" both read as shrinkage when the items fully overlap;
+  `expected 2 got 1` and `got 1.5` are two distinct identities (digits are kept), never merged;
 - P prefers to under-report: an error that moves to a **different file** always counts as
   progress (fixing separate files must not be called a patch chain). The cost is that a real
   chain pushing the error from A into B also goes unmentioned;
 - F needs an extractable path. Without one (plain-text errors, only `[exit code: 1]`) the
   failure keeps B's bookkeeping but never joins an error family — better silent than merging
   errors from unrelated projects into one target;
+- A line is classified before it may join the set: only `error` counts as a failure, while
+  `warning` columns (ESLint's `src/a.js:1:1  warning  'x' is defined...`), aggregate summaries
+  (`10 problems`) and log noise never do. The classification looks only at the leading
+  severity column, never at the body - a real `AssertionError: warning total mismatch` still
+  counts, otherwise the fix would trade a false positive for a miss;
+- A target's boundary is decided by what the path looks like, not by the first space: a
+  root-level bare filename like `a.ts` and a spaced absolute path like
+  `C:/work/My Project/src/a.ts` must both be recognised whole, while an error message that
+  immediately follows a path (`C:/work/a.ts: error: cannot open`) must not be swallowed into
+  the target;
 - B now counts two kinds of repetition: `isError:true` tool errors, and `isError:false`
   **measurement failures** (`npm test` exiting non-zero). The latter never entered error
   bookkeeping before, so "one identical failure, unchanged, eight rounds in a row" produced
@@ -262,7 +281,7 @@ dsh plugin add dsh-better-debug
 From the release tarball (byte-identical to the npm package):
 
 ```bash
-dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.2/dsh-better-debug-0.3.2.tgz
+dsh plugin add https://github.com/Leonlee114514/dsh-better-debug/releases/download/v0.3.4/dsh-better-debug-0.3.4.tgz
 ```
 
 Manual link (for local development):
@@ -400,7 +419,7 @@ registration is skipped with a log line and the gate is unaffected.
 ## Local verification
 
 ```bash
-node test/sim.mjs           # 89 cases: gate semantics and portability
+node test/sim.mjs           # 102 cases: gate semantics and portability
 node test/panel.mjs         # 62 cases: parsing, aggregation, generation tracking, themes, instrumentation
 npm run test:posix          # rerun both suites under POSIX path semantics
 npm run test:linux          # rerun under Linux platform semantics (case-sensitive)
@@ -487,6 +506,45 @@ merge; the exception message must stay in the set; the echoed source line must n
 shared item; `{A}→{A,B}→{A,C}` must still read as A recurring; and a second B must fire after
 a search once the threshold is reached again. Against 0.3.2 these cases are red 6 of 89;
 after the fixes, `89/89`.
+
+### Fifth round: stop adding regexes, start classifying diagnostic lines
+
+A third review then took the parse layer apart again and found that the previous two rounds
+had been adding one regex per observed shape. What was missing was a classification: is this
+line an `error`, a `warning`, a `frame`, `source`, an `aggregate` summary, or `log` noise?
+Patching shapes one by one produced a parser that recognises a compiler at the target layer
+but not at the identity layer - case 46 asserted that `errorTargetOf` understood webpack
+locations, and never asserted that `failureSetOf` produced the same identity after the line
+number drifted. All five defects come from that gap:
+
+- **A bare filename in the repository root was not recognised** (defect 1): the path rule
+  required `directory + filename`, so `a.ts(12,9)` yielded no target, leaving the locator
+  unstripped - one line shift produced a brand-new failure;
+- **Absolute paths were truncated at the first space** (defect 2): the path regex stops at the
+  first blank, so `C:/work/My Project/src/a.ts` yielded `c:/work/my` and left the remainder in
+  the message;
+- **Webpack's space-separated location range was not stripped** (defect 3): it writes
+  `./src/index.js 5:0-20` - a space, then a line:column-range, neither bracketed nor leading
+  with a colon;
+- **Any line carrying a path joined the set** (defect 4): `src/a.js:1:1  warning  'first' is
+  defined...` became a failure item. With the error unchanged and only the warning's variable
+  name moving, the set changed every round: B could not recognise the repeat and P reported
+  the warning churn as "another failure repaired";
+- **pytest's `> assert ...` echo became a shared item** (defect 5): two different assertions
+  share that line, so O's item-intersection test read healthy TDD as "the old failure is
+  back".
+
+The fix is not five more regexes: classify first, then decide whether the line may enter the
+set. Frames contribute a target only, the `E` line is the diagnostic itself, `>` / `<` and
+indented lines inside a frame block are echoes, and `warning` columns and aggregate lines never
+enter. Each rule ships with a counter-example - in particular, a real failure whose message
+contains the word `warning` must still enter, so the fix cannot trade a false positive for a
+miss.
+
+Case group `54` covers it (13 assertions: bare filename, spaced path, webpack locator, ESLint
+warning both ways, pytest echo and the `E` line). Against 0.3.3 these are red 9 of 102; after
+the fixes, `102/102`. All three probe rounds (`deep-review-probes`, `-v032-`, `-v033-`) match
+expectations line for line.
 
 The three extra suites are regression fences for three classes of "green locally, red in
 production":

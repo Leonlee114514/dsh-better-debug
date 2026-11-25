@@ -1756,6 +1756,118 @@ check(
   )
 }
 
+// ── 54. 第三轮深审：位置归一化与诊断类型（0.3.3 的五个缺陷）
+//
+// 这一组全部是**解析层**的断言：它们不看注入，只看 `failureSetOf` / `errorTargetOf`
+// 的输出。为什么必须单独测解析层：0.3.3 的 46 号用例只验了 `errorTargetOf` 认得
+// webpack 的位置形态，没验 `failureSetOf` 的身份**在行号漂移后仍然相同** ——
+// 「支持某个编译器」于是只在目标层成立、在身份层不成立（第三轮缺陷 3 的验收缺口）。
+{
+  // 54a 根目录裸文件名：`a.ts(12,9)`。REL_SOURCE 要求「目录 + 文件名」，
+  // 于是裸文件名抽不出目标，位置也就没得剥 → 行号一漂就成了新失败（缺陷 1）。
+  const bare12 = 'a.ts(12,9): error TS2322: Type string is not assignable to type number'
+  const bare13 = 'a.ts(13,9): error TS2322: Type string is not assignable to type number'
+  check('裸文件名：a.ts 应被识别为目标', samePath(errorTargetOf(bare12), 'a.ts'), `actual=${errorTargetOf(bare12)}`)
+  check(
+    '裸文件名：仅行号漂移 → 同一集合',
+    failureSetKey(failureSetOf(bare12)) === failureSetKey(failureSetOf(bare13)),
+    `${failureSetKey(failureSetOf(bare12))} vs ${failureSetKey(failureSetOf(bare13))}`
+  )
+
+  // 54b 带空格的绝对路径：`C:/work/My Project/src/a.ts(12,9)`。
+  // 通用绝对路径正则用 `[^\s"';()]+` 吃到第一个空格就停，目标是 `c:/work/my`，
+  // 剩下的 `Project/src/a.ts(12,9)` 留在消息里 —— 于是行号漂移看起来像换了文件（缺陷 2）。
+  const spaced12 = 'C:/work/My Project/src/a.ts(12,9): error TS2322: bad'
+  const spaced13 = 'C:/work/My Project/src/a.ts(13,9): error TS2322: bad'
+  check(
+    '带空格路径：目标必须完整（不能截断在第一个空格）',
+    samePath(errorTargetOf(spaced12), 'C:/work/My Project/src/a.ts'),
+    `actual=${errorTargetOf(spaced12)}`
+  )
+  check(
+    '带空格路径：仅行号漂移 → 同一集合',
+    failureSetKey(failureSetOf(spaced12)) === failureSetKey(failureSetOf(spaced13)),
+    `${failureSetKey(failureSetOf(spaced12))} vs ${failureSetKey(failureSetOf(spaced13))}`
+  )
+  // 反例：路径后面紧跟的消息不能被一起吃进目标里。
+  // `C:/work/a.ts: error: cannot open` 的目标只能是那个文件，不能是「文件 + 错误开头」。
+  check(
+    '带空格路径反例：路径后的错误消息不得被吃进目标',
+    samePath(errorTargetOf('C:/work/a.ts: error: cannot open file'), 'C:/work/a.ts'),
+    `actual=${errorTargetOf('C:/work/a.ts: error: cannot open file')}`
+  )
+
+  // 54c webpack 的空格分隔位置范围：`./src/index.js 5:0-20`。
+  // 位置不是括号也不是冒号开头，而是「空格 + 行:列-列」，旧 cutLocatorAt 不认（缺陷 3）。
+  const webpack5 = 'ERROR in ./src/index.js 5:0-20\nModule build failed: Unexpected token'
+  const webpack6 = 'ERROR in ./src/index.js 6:0-20\nModule build failed: Unexpected token'
+  check(
+    'webpack：空格分隔的位置范围 5:0-20 vs 6:0-20 → 同一集合',
+    failureSetKey(failureSetOf(webpack5)) === failureSetKey(failureSetOf(webpack6)),
+    `${failureSetKey(failureSetOf(webpack5))} vs ${failureSetKey(failureSetOf(webpack6))}`
+  )
+
+  // 54d 含路径的 warning 不得进集合（缺陷 4）。
+  // 「含路径」只证明它能定位，不证明它是这次失败。同一个 error 一字不变、
+  // 只有无关 warning 的变量名在变，集合若跟着变，P 就把 warning 当成「修出下一个错」。
+  const lintError = "src/a.js:12:5  error  'actual' is not defined  no-undef"
+  const lintWarn = (name) => `src/a.js:1:1  warning  '${name}' is defined but never used  no-unused-vars`
+  check(
+    'ESLint：新增无关 warning 不得改变集合',
+    failureSetKey(failureSetOf(lintError)) === failureSetKey(failureSetOf(`${lintError}\n${lintWarn('first')}`)),
+    `size ${failureSetOf(lintError).size} → ${failureSetOf(`${lintError}\n${lintWarn('first')}`).size}`
+  )
+  check(
+    'ESLint：warning 文案逐轮变化 → 集合不变',
+    failureSetKey(failureSetOf(`${lintError}\n${lintWarn('first')}`)) ===
+      failureSetKey(failureSetOf(`${lintError}\n${lintWarn('second')}`)),
+    `size ${failureSetOf(`${lintError}\n${lintWarn('first')}`).size}`
+  )
+  // 反例：消息正文里出现 warning 这个词的**真失败**不能被当成 warning 丢掉。
+  // 判据只看行首那个严重级别列，不看正文 —— 否则 `AssertionError: warning total mismatch`
+  // 会被静默排除，那是从误报换成了漏报。
+  check(
+    'ESLint 反例：正文含 warning 的真实错误仍要进集合',
+    failureSetOf("src/a.js:12:5  error  AssertionError: warning total mismatch  no-undef").size === 1,
+    `size=${failureSetOf("src/a.js:12:5  error  AssertionError: warning total mismatch  no-undef").size}`
+  )
+
+  // 54e pytest 的 `> assert …` 源码回显（缺陷 5）。
+  // 两个不同的断言共用同一个文件、同一行、同样的回显行，只有 `E AssertionError: xxx` 不同。
+  // 回显若进集合，就成了一条公共条目 —— O 的「条目交集」判据把健康 TDD 读成「旧失败回来了」。
+  const pytest = (name, echo = true) =>
+    [
+      '============================= FAILURES ==============================',
+      '______________________________ test_case ___________________________',
+      'tests/test_a.py:10: in test_case',
+      '    def test_case():',
+      echo ? '>       assert case == expected' : '',
+      `E       AssertionError: ${name}`,
+      `FAILED tests/test_a.py::test_case - AssertionError: ${name}`
+    ]
+      .filter((line) => line.length > 0)
+      .join('\n')
+  const sharedItems = (a, b) => [...a].filter((item) => b.has(item))
+  check(
+    'pytest：不同断言不得共享 > assert 回显条目',
+    sharedItems(failureSetOf(pytest('case-one')), failureSetOf(pytest('case-two'))).length === 0,
+    `shared=${JSON.stringify(sharedItems(failureSetOf(pytest('case-one')), failureSetOf(pytest('case-two'))))}`
+  )
+  check(
+    'pytest：不同断言的身份必须不同（E 行是条目本体）',
+    failureSetKey(failureSetOf(pytest('case-one'))) !== failureSetKey(failureSetOf(pytest('case-two'))),
+    `${failureSetKey(failureSetOf(pytest('case-one')))} vs ${failureSetKey(failureSetOf(pytest('case-two')))}`
+  )
+  check(
+    'pytest：同一断言仅栈帧行号漂移 → 同一集合',
+    failureSetKey(failureSetOf(pytest('case-one'))) ===
+      failureSetKey(failureSetOf(pytest('case-one').replace('tests/test_a.py:10:', 'tests/test_a.py:11:'))),
+    `key=${failureSetKey(failureSetOf(pytest('case-one')))}`
+  )
+  check('pytest：集合只含一条（栈帧、源码回显、FAILED 汇总都不进）', failureSetOf(pytest('case-one')).size === 1,
+    `size=${failureSetOf(pytest('case-one')).size}`)
+}
+
 // ── 29. 导出形状
 check('导出 name', name === 'dsh-better-debug', name)
 const failed = results.filter((r) => !r.pass)
