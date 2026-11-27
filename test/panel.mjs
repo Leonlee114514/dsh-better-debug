@@ -3,11 +3,11 @@
 //
 // 重点守的是「指标不许夸大」这条线（评审 m00176 中6）：
 // 字段只能描述「提示后发生了什么」，不能出现暗示因果的名字（changed / gain / effective）。
-import { readFileSync, rmSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from '../lib/index.js'
-import { aggregate, parseLine, parseLog, scanFields, estimateTokens, readAggregate } from '../lib/panel.js'
+import { apply, createLogWriter } from '../lib/index.js'
+import { aggregate, createRequestGate, parseLine, parseLog, scanFields, estimateTokens, readAggregate, registerPanel } from '../lib/panel.js'
 import { charsFor, messageText } from '../lib/text.js'
 
 // record() 是 appendFile，插件里刻意不 await（不能因为写日志拖慢每一步）。
@@ -63,7 +63,7 @@ function check(label, pass, detail) {
     '2026-11-07T02:38:41.001Z change session=s-1 turn=39 inj=a1b2c3d4 after=C tool=ops_bash class=verify steps=2'
   )
   const measured = parseLine('2026-11-07T02:38:39.001Z measure session=s-1 turn=39 tool=ops_bash ok=true exit=0 cleared=2')
-  const arm = parseLine('2026-11-07T02:38:30.001Z arm session=s-1 turn=39 step=8 gap=2')
+  const arm = parseLine('2026-11-07T02:38:30.001Z arm session=s-1 turn=39 step=8 writes=3')
   const applyLine = parseLine(
     '2026-11-07T01:24:19.226Z apply pid=17884 logFile=C:/x/better-debug.log A=3 B=2 C=2 budget=3 window=6 panel=true'
   )
@@ -91,7 +91,7 @@ function check(label, pass, detail) {
     measured.kind === 'measure' && measured.ok === true && measured.exit === 0 && measured.cleared === 2,
     `ok=${measured.ok} exit=${measured.exit} cleared=${measured.cleared}`
   )
-  check('parseLine 认 arm', arm.kind === 'arm' && arm.gap === 2, `gap=${arm.gap}`)
+  check('parseLine 认 arm', arm.kind === 'arm' && arm.writes === 3, `writes=${arm.writes}`)
   check(
     'parseLine 认 apply 与阈值 + 预算',
     applyLine.kind === 'apply' && applyLine.pid === 17884 &&
@@ -460,11 +460,14 @@ function check(label, pass, detail) {
   )
 }
 
-// ── 10. arm 行：解释「改完 N 步为什么没提醒」，且不计入触发
+// ── 10. arm 行：解释「改了几处为什么没提醒」，且不计入触发
+//
+// 字段是 writes=（盲改次数），不是旧的 gap=（距上次改的步数）：gap 恒等于阈值，
+// 说明它数的是步而不是盲改，那正是 C 误报的根因（0.3.5 换轴）。
 {
   const text = [
-    '2026-11-11T00:00:00.000Z arm session=s-1 turn=1 step=9 gap=2',
-    '2026-11-11T00:00:01.000Z arm session=s-1 turn=1 step=10 gap=3'
+    '2026-11-11T00:00:00.000Z arm session=s-1 turn=1 step=9 writes=3',
+    '2026-11-11T00:00:01.000Z arm session=s-1 turn=1 step=10 writes=5'
   ].join('\n')
   const a = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length })
   check('arm 行计数，不算注入', a.log.arms === 2 && a.injects.total === 0, `arms=${a.log.arms}`)
@@ -716,6 +719,456 @@ function check(label, pass, detail) {
   check('方案层四条条形各有自己的填充色（亮暗两套）', fills.length === 4, `fills=${fills.join('')}`)
 }
 
+// ── 12. 转向率必须按 inj= 关联注入，不能数行数（否则 >100% / silent 为负）
+{
+  const lines = []
+  for (let i = 0; i < 3; i += 1) {
+    lines.push('2026-11-11T00:00:0' + i + '.000Z inject session=s-1 turn=' + (i + 1) + ' step=1 signals=C inj=j' + i + ' chars=100 tokens=25 files=0 worstEdits=0 worstStreak=0 worstErrors=0 searched=false measured=no')
+  }
+  // 一次注入在窗口内每一步都结算一次：同一个 inj 出现 4 次 outcome、5 次 change。
+  for (let i = 0; i < 4; i += 1) {
+    lines.push('2026-11-11T00:01:0' + i + '.000Z outcome session=s-1 turn=1 inj=j0 after=C first=bash class=shell steps=' + i)
+  }
+  lines.push('2026-11-11T00:01:09.000Z outcome session=s-1 turn=2 inj=j1 after=C first=bash class=shell steps=0')
+  for (let i = 0; i < 5; i += 1) {
+    lines.push('2026-11-11T00:02:0' + i + '.000Z change session=s-1 turn=1 inj=j1 after=C first=verify class=verify steps=' + i)
+  }
+  const text = lines.join('\n')
+  const a = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length })
+  check(
+    '转向率按 inj= 去重关联：rate ≤ 100% 且 silent ≥ 0',
+    a.turned.rate !== null && a.turned.rate <= 1 && a.firstAction.silent >= 0 &&
+      a.turned.total === 1 && a.firstAction.reported === 2,
+    'rate=' + a.turned.rate + ' silent=' + a.firstAction.silent + ' turned=' + a.turned.total + ' reported=' + a.firstAction.reported
+  )
+  check(
+    '三条注入里两条有 outcome、一条没有 → reported=2 / silent=1',
+    a.firstAction.reported === 2 && a.firstAction.silent === 1,
+    'reported=' + a.firstAction.reported + ' silent=' + a.firstAction.silent
+  )
+}
+
+// ── 13. 没有 apply 行时，阈值/预算/窗口必须回退到**配置对象本身**的键名
+{
+  const text = '2026-11-11T00:00:00.000Z inject session=s-1 turn=1 step=1 signals=A inj=j1 chars=100 tokens=25 files=0 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no'
+  // registerPanel 传的是整个 cfg：键名是配置项原名，不是 A/B/C。
+  const cfg = { repeatEditThreshold: 4, repeatErrorThreshold: 5, noVerifyWrites: 6, maxInjectsPerTurn: 7, changedWindow: 8 }
+  const a = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length, thresholds: cfg })
+  check(
+    '无 apply 行时阈值回退认配置原名（A/B/C 过去恒为 0）',
+    a.thresholds.A === 4 && a.thresholds.B === 5 && a.thresholds.C === 6,
+    'thresholds=' + JSON.stringify(a.thresholds)
+  )
+  check(
+    '无 apply 行时预算/窗口回退认 maxInjectsPerTurn / changedWindow',
+    a.budget === 7 && a.window === 8,
+    'budget=' + a.budget + ' window=' + a.window
+  )
+  // 反面：显式给 A/B/C 的调用方仍然优先，别被配置键名抢走。
+  const b = aggregate(parseLog(text), { logFile: '', exists: true, bytes: text.length, thresholds: { A: 2, B: 3, C: 4, repeatEditThreshold: 9 } })
+  check(
+    '显式 A/B/C 优先于同名的配置键',
+    b.thresholds.A === 2 && b.thresholds.B === 3 && b.thresholds.C === 4,
+    'thresholds=' + JSON.stringify(b.thresholds)
+  )
+}
+
+// ── 14. registerPanel 真跑一次：路由注册、HTML、API、404、热重载摘路由
+//
+// 过去这一段完全没有测试：sim.mjs 的假 ctx 在 webServer 缺失时让 ctx.inject 什么都不做，
+// 于是 registerPanel 那 63 行在 CI 里从未被执行过 —— 它坏了没有任何信号。
+// 这里直接调用它，用一个假 webServer（register 收集路由 + prefixes 是真 Map），
+// 再把 handler 当普通函数调，喂进伪造的 req/res。
+{
+  const routes = []
+  const prefixes = new Map()
+  const effects = []
+  const ctx = {
+    webServer: {
+      prefixes,
+      register(route) {
+        routes.push(route)
+        prefixes.set(route.path, route)
+        return () => {
+          const at = routes.indexOf(route)
+          if (at >= 0) routes.splice(at, 1)
+          prefixes.delete(route.path)
+        }
+      }
+    },
+    effect(run, label) {
+      effects.push({ label, dispose: run() })
+    }
+  }
+  const cfg = { logFile: '', repeatEditThreshold: 3, repeatErrorThreshold: 2, noVerifyWrites: 2, maxInjectsPerTurn: 3, changedWindow: 6 }
+  const dispose = registerPanel(ctx, () => cfg)
+  check(
+    'registerPanel: 注册了 /better-debug 前缀路由，且返回 disposer',
+    routes.length === 1 && routes[0].path === '/better-debug' && routes[0].kind === 'prefix' && typeof dispose === 'function',
+    'routes=' + routes.map((r) => r.kind + ':' + r.path).join(',')
+  )
+  check(
+    'registerPanel: 路由交给 ctx.effect 管生命周期（热重载能摘）',
+    effects.length === 1 && effects[0].label === 'better-debug.panel-route' && typeof effects[0].dispose === 'function',
+    'effects=' + effects.map((e) => e.label).join(',')
+  )
+
+  // 假的 req/res：res 只记状态码、头与 body。
+  const call = async (path) => {
+    const out = { status: 0, headers: {}, body: '' }
+    const res = {
+      writeHead(status, headers) {
+        out.status = status
+        out.headers = headers ?? {}
+      },
+      end(body) {
+        out.body = String(body ?? '')
+      }
+    }
+    await routes[0].handler({ url: path }, res)
+    return out
+  }
+
+  const page = await call('/better-debug/index.html')
+  check(
+    'registerPanel: /better-debug/index.html 返回真实页面（不是 404 空框）',
+    page.status === 200 && page.body.includes('<html') && page.body.length > 2000,
+    'status=' + page.status + ' bytes=' + page.body.length
+  )
+  check(
+    'registerPanel: 页面禁用缓存（否则面板会一直显示旧数据）',
+    page.headers['cache-control'] === 'no-store',
+    'cache-control=' + page.headers['cache-control']
+  )
+  // 面板页是纯内联（无 src= / href= / @import / url()），CSP 该收到最紧一档；
+  // nosniff 防 /better-debug/api 的 JSON 被嗅探成 HTML 执行（响应体里有会话 id 与报错样本）。
+  const csp = page.headers['content-security-policy'] ?? ''
+  check(
+    'registerPanel: 页面带 CSP 且关掉外部资源（default-src none + 内联 style/script + connect-src self）',
+    csp.includes("default-src 'none'") &&
+      csp.includes("script-src 'unsafe-inline'") &&
+      csp.includes("style-src 'unsafe-inline'") &&
+      csp.includes("connect-src 'self'"),
+    'csp=' + csp
+  )
+  check(
+    'registerPanel: 页面与 API 都带 nosniff（JSON 不能被当 HTML 嗅探执行）',
+    page.headers['x-content-type-options'] === 'nosniff',
+    'page nosniff=' + page.headers['x-content-type-options']
+  )
+
+  const api = await call('/better-debug/api')
+  let parsed
+  try {
+    parsed = JSON.parse(api.body)
+  } catch {
+    parsed = void 0
+  }
+  check(
+    'registerPanel: /better-debug/api 返回可解析的 JSON 聚合（日志不存在也不炸）',
+    api.status === 200 && parsed !== void 0 && parsed.log?.exists === false && parsed.thresholds?.A === 3,
+    'status=' + api.status + ' exists=' + parsed?.log?.exists + ' A=' + parsed?.thresholds?.A
+  )
+  check(
+    'registerPanel: API 的阈值来自 getConfig()（不是写死的默认）',
+    parsed?.thresholds?.B === 2 && parsed?.thresholds?.C === 2 && parsed?.budget === 3 && parsed?.window === 6,
+    'B=' + parsed?.thresholds?.B + ' budget=' + parsed?.budget + ' window=' + parsed?.window
+  )
+
+  const raw = await call('/better-debug/api?raw=1')
+  check(
+    'registerPanel: raw=1 走另一条分支（面板用来判断后端版本）',
+    raw.status === 200 && raw.body.includes('\"version\": 3'),
+    'status=' + raw.status
+  )
+
+  const miss = await call('/better-debug/nope')
+  check(
+    'registerPanel: 未匹配的路径回 404 JSON，不是 HTML',
+    miss.status === 404 && miss.body.includes('not-found') && miss.headers['content-type'].includes('application/json'),
+    'status=' + miss.status
+  )
+
+  // 热重载：第二次注册必须把上一代的路由摘掉，否则 prefixes 里会堆同名路由。
+  registerPanel(ctx, () => cfg)
+  check(
+    'registerPanel: 第二次注册摘掉上一代路由（热重载不堆叠）',
+    routes.length === 1 && prefixes.size === 1,
+    'routes=' + routes.length + ' prefixes=' + prefixes.size
+  )
+  // 再模拟「上一代没记 disposer」的旧版本：手塞一条陈旧路由进 prefixes。
+  // 新代码必须先删同名 key 再注册，否则路由表里会同时存在新旧两条 handler。
+  const stale = { kind: 'prefix', path: '/better-debug', handler: async () => 'stale' }
+  prefixes.set('/better-debug', stale)
+  registerPanel(ctx, () => cfg)
+  check(
+    'registerPanel: 上一代没留 disposer 时也能从 prefixes 里删掉同名路由',
+    prefixes.size === 1 && prefixes.get('/better-debug') !== stale,
+    'prefixes=' + prefixes.size + ' replaced=' + (prefixes.get('/better-debug') !== stale)
+  )
+}
+
+// ── 14b. 面板路由的准入闸
+//
+// webServer.register 只负责路由，鉴权要插件自己调 connection.requestRejection ——
+// dsh-host-open-in-app 与 dsh-experimental-inspector 都这么做。少了这一步，面板就成了
+// 整条 web 面上唯一不要凭证的路径：2026-11-26 实测本机 dsh web 被 relay 暴露到公网后，
+// `https://<instance>.dsh-market.com/` 是 401，而 `/better-debug/api` 是 200，
+// 返回真实会话 id、报错样本与日志绝对路径。
+{
+  // 假 connection：只实现 requestRejection，按请求上带的 cookie 头决定拒绝码。
+  const makeCtx = (requestRejection) => {
+    const routes = []
+    const prefixes = new Map()
+    const services = new Map()
+    if (requestRejection !== void 0) services.set('connection', { requestRejection })
+    return {
+      webServer: {
+        prefixes,
+        register(route) {
+          routes.push(route)
+          prefixes.set(route.path, route)
+          return () => { routes.splice(routes.indexOf(route), 1); prefixes.delete(route.path) }
+        }
+      },
+      get(name) {
+        return services.get(name)
+      },
+      effect(run) {
+        run()
+      },
+      routes
+    }
+  }
+
+  const callWith = async (route, req) => {
+    const out = { status: 0, headers: {}, body: '' }
+    const res = {
+      writeHead(status, headers) {
+        out.status = status
+        out.headers = headers ?? {}
+      },
+      end(body) {
+        out.body = String(body ?? '')
+      }
+    }
+    await route.handler(req, res)
+    return out
+  }
+
+  // 有 connection 服务：宿主说 401 就必须 401，且不能泄漏面板内容。
+  const guarded = makeCtx((req) => (req.headers?.cookie === 'ok' ? 0 : 401))
+  registerPanel(guarded, () => ({ logFile: '' }))
+  const route = guarded.routes[0]
+  const denied = await callWith(route, { url: '/better-debug/api', headers: {} })
+  check(
+    '面板准入: 无凭证时 /better-debug/api 回 401，不返回任何日志内容',
+    denied.status === 401 && denied.body === 'authentication required',
+    'status=' + denied.status + ' body=' + denied.body
+  )
+  check(
+    '面板准入: 401 响应体是纯文本且带 nosniff（拒绝页也不许被嗅探执行）',
+    denied.headers['content-type'].includes('text/plain') && denied.headers['x-content-type-options'] === 'nosniff',
+    'type=' + denied.headers['content-type'] + ' nosniff=' + denied.headers['x-content-type-options']
+  )
+  const pageDenied = await callWith(route, { url: '/better-debug/index.html', headers: {} })
+  check(
+    '面板准入: 页面同样要过闸（不能只挡 API 放行 HTML）',
+    pageDenied.status === 401 && !pageDenied.body.includes('<html'),
+    'status=' + pageDenied.status + ' bytes=' + pageDenied.body.length
+  )
+  const allowed = await callWith(route, { url: '/better-debug/api?raw=1', headers: { cookie: 'ok' } })
+  check(
+    '面板准入: 宿主放行时照常返回（闸不改变正常路径）',
+    allowed.status === 200,
+    'status=' + allowed.status
+  )
+
+  // Host/Origin 不合规：宿主回 403，body 也要区分开。
+  const forbidden = makeCtx(() => 403)
+  registerPanel(forbidden, () => ({ logFile: '' }))
+  const blocked = await callWith(forbidden.routes[0], { url: '/better-debug/api', headers: { host: 'evil.example' } })
+  check(
+    '面板准入: 宿主判 403 时回 forbidden（与 401 区分，便于排查是 Host 还是 cookie）',
+    blocked.status === 403 && blocked.body === 'forbidden',
+    'status=' + blocked.status + ' body=' + blocked.body
+  )
+
+  // 没有 connection 服务（headless profile、单测假 ctx）：恒放行，面板仍可用。
+  const bare = makeCtx(void 0)
+  registerPanel(bare, () => ({ logFile: '' }))
+  const open = await callWith(bare.routes[0], { url: '/better-debug/api?raw=1', headers: {} })
+  check(
+    '面板准入: 没有 connection 服务时恒放行（headless profile 不被自家闸关掉）',
+    open.status === 200,
+    'status=' + open.status
+  )
+  check(
+    '面板准入: 服务缺 requestRejection 方法时也恒放行（不因宿主版本差异炸掉面板）',
+    createRequestGate({ get: () => ({}) })({}) === 0,
+    'gate=' + createRequestGate({ get: () => ({}) })({})
+  )
+  // 服务晚到：注册时 connection 还不存在，请求时才起来 —— 闸必须那时才读，
+  // 否则会永久退化成恒放行（没有任何信号）。
+  const late = new Map()
+  const lateCtx = { get: (name) => late.get(name) }
+  const lateGate = createRequestGate(lateCtx)
+  const before = lateGate({ headers: {} })
+  late.set('connection', { requestRejection: () => 401 })
+  const after = lateGate({ headers: {} })
+  check(
+    '面板准入: connection 服务晚于面板注册就绪时，闸在请求时才读、仍然生效',
+    before === 0 && after === 401,
+    'before=' + before + ' after=' + after
+  )
+}
+
+// ── 15. createLogWriter：轮转、最老一份被丢弃、目录只 mkdir 一次（P1-10 / A12）
+{
+  const base = join(tmpdir(), 'better-debug-writer-' + process.pid + '-' + Date.now())
+  const logFile = join(base, 'nested', 'better-debug.log')
+  const warns = []
+  const ctx = { logger: { warn: (line) => warns.push(line) } }
+  const line = (index) => 'apply pid=1 logFile=x A=3 B=2 C=2 seq=' + index
+  const readAll = (path) => readFileSync(path, 'utf8').split('\n').filter((row) => row.length > 0)
+
+  // 15a logFile 为空串 = 显式关闭：不建目录、不写、不 warn。
+  const off = createLogWriter({ cfg: { logFile: '', logMaxBytes: 1024, logKeep: 2 }, ctx })
+  await off.record(line(0))
+  check('createLogWriter: logFile 为空串时什么都不做', warns.length === 0 && !existsSync(base))
+
+  // 15b 首次写自动建多级目录（A12 只建一次的前提是先建起来）。
+  const writer = createLogWriter({ cfg: { logFile, logMaxBytes: 1024, logKeep: 2 }, ctx })
+  await writer.record(line(1))
+  await writer.record(line(2))
+  check(
+    'createLogWriter: 首次写自动建多级目录并追加两行',
+    existsSync(join(base, 'nested')) && readAll(logFile).length === 2,
+    'lines=' + readAll(logFile).length
+  )
+
+  // 15c 游标从 stat 补上：新实例不知道已有长度，到量就先轮转再写。
+  const rotator = createLogWriter({ cfg: { logFile, logMaxBytes: 1, logKeep: 2 }, ctx })
+  await rotator.record(line(3))
+  check(
+    'createLogWriter: 超过 logMaxBytes 先轮转再写，旧内容进 .1',
+    existsSync(logFile + '.1') && readAll(logFile + '.1').at(-1).includes('seq=2') && readAll(logFile).at(-1).includes('seq=3'),
+    'main=' + JSON.stringify(readAll(logFile))
+  )
+
+  // 15d logKeep 是保留份数上限：连续轮转后最老的一份被丢弃，不会出现 .3。
+  for (let index = 4; index <= 6; index += 1) await rotator.record(line(index))
+  check(
+    'createLogWriter: 轮转到 logKeep 份后最老一份被丢弃（不生成 .3）',
+    existsSync(logFile + '.2') && !existsSync(logFile + '.3'),
+    'has1=' + existsSync(logFile + '.1') + ' has2=' + existsSync(logFile + '.2') + ' has3=' + existsSync(logFile + '.3')
+  )
+
+  // 15e A12：目录建过就不再 mkdir。删掉目录后写一次必须失败 —— 若每条都 mkdir，
+  // 这里会被重新建出来，写成功、warn 为 0，A12 就白改了。
+  rmSync(join(base, 'nested'), { recursive: true, force: true })
+  const beforeWarns = warns.length
+  await rotator.record(line(7))
+  check(
+    'createLogWriter: 目录被删后不重建（mkdir 只在第一次做）',
+    warns.length === beforeWarns + 1 && !existsSync(logFile),
+    'warns=' + (warns.length - beforeWarns) + ' exists=' + existsSync(logFile)
+  )
+
+  // 15f 失败后把目录/游标打回未知：下一次写自愈（mkdir 重试一次，游标重新 stat）。
+  await rotator.record(line(8))
+  check(
+    'createLogWriter: 写失败后状态打回，下一次写自愈',
+    existsSync(logFile) && readAll(logFile).length === 1 && readAll(logFile)[0].includes('seq=8'),
+    'lines=' + readAll(logFile).length
+  )
+
+  // 15g 落盘失败只 warn 一次：logFile 指向一个目录，appendFile 必然失败。
+  const doomed = join(base, 'is-a-dir.log')
+  mkdirSync(doomed, { recursive: true })
+  const badWarns = []
+  const bad = createLogWriter({
+    cfg: { logFile: doomed, logMaxBytes: 64 * 1024, logKeep: 2 },
+    ctx: { logger: { warn: (row) => badWarns.push(row) } }
+  })
+  await bad.record(line(9))
+  await bad.record(line(10))
+  await bad.record(line(11))
+  check('createLogWriter: 持续写失败只 warn 一次', badWarns.length === 1, 'warns=' + badWarns.length)
+
+  rmSync(base, { recursive: true, force: true })
+}
+
+// ── 16. readAggregate 增量解析：只读新增、变小重来、多字节不切坏（P1-10）
+{
+  const dir = join(tmpdir(), 'better-debug-read-' + process.pid + '-' + Date.now())
+  mkdirSync(dir, { recursive: true })
+  const at = '2026-11-07T02:00:00.000Z '
+  const injectLine = (inj, sample) =>
+    at + 'inject session=s1 turn=1 step=1 signals=C chars=10 files=1 worstEdits=0 worstStreak=0 worstErrors=0 searched=false measured=no inj=' + inj + ' sample=' + sample + '\n'
+  const Q = String.fromCharCode(34)
+  const quoted = (text) => Q + text + Q
+
+  const logFile = join(dir, 'a.log')
+  writeFileSync(logFile, injectLine('i1', quoted('a')) + injectLine('i2', quoted('b')), 'utf8')
+  const first = readAggregate(logFile, {})
+  check(
+    'readAggregate: 首次全量解析，bytes 是文件总字节数',
+    first.log.lines === 2 && first.log.bytes === statSync(logFile).size && first.injects.total === 2,
+    'lines=' + first.log.lines + ' bytes=' + first.log.bytes
+  )
+
+  appendFileSync(logFile, injectLine('i3', quoted('c')), 'utf8')
+  const second = readAggregate(logFile, {})
+  check(
+    'readAggregate: 追加后只解析新增，累计行数与总字节同步增长',
+    second.log.lines === 3 && second.injects.total === 3 && second.log.bytes === statSync(logFile).size,
+    'lines=' + second.log.lines + ' bytes=' + second.log.bytes
+  )
+
+  // 同一路径变短 = 被截断或被换掉，必须丢掉旧记录重读，不能把旧行留在聚合里。
+  writeFileSync(logFile, injectLine('i9', quoted('z')), 'utf8')
+  const shrunk = readAggregate(logFile, {})
+  check(
+    'readAggregate: 文件变小就重置缓存，不残留旧行',
+    shrunk.log.lines === 1 && shrunk.injects.total === 1 && shrunk.recent.at(-1).inj === 'i9',
+    'lines=' + shrunk.log.lines + ' inj=' + (shrunk.recent.at(-1) || {}).inj
+  )
+
+  // 多字节字符跨块：tail 存字节不存字符串。若先解码再切，半个「中」会变成 U+FFFD。
+  const wideFile = join(dir, 'b.log')
+  const wide = Buffer.from(injectLine('i4', quoted('中文')), 'utf8')
+  const cut = wide.indexOf(Buffer.from('中', 'utf8')) + 1
+  writeFileSync(wideFile, wide.subarray(0, cut))
+  const partial = readAggregate(wideFile, {})
+  check(
+    'readAggregate: 半个多字节字符只留在 tail，不产出坏行',
+    partial.log.lines === 0 && partial.log.bytes === cut,
+    'lines=' + partial.log.lines + ' bytes=' + partial.log.bytes
+  )
+  appendFileSync(wideFile, wide.subarray(cut))
+  const whole = readAggregate(wideFile, {})
+  check(
+    'readAggregate: 补齐后解析出完整样本（tail 存字节不存字符串）',
+    whole.log.lines === 1 && whole.recent.at(-1).sample === '中文' && whole.log.bytes === wide.length,
+    'lines=' + whole.log.lines + ' sample=' + JSON.stringify((whole.recent.at(-1) || {}).sample)
+  )
+
+  // 轮转：主文件被换掉（更短的新文件），缓存必须按新文件重来。
+  const rotFile = join(dir, 'c.log')
+  writeFileSync(rotFile, injectLine('r1', quoted('1')) + injectLine('r2', quoted('2')) + injectLine('r3', quoted('3')), 'utf8')
+  readAggregate(rotFile, {})
+  renameSync(rotFile, rotFile + '.1')
+  writeFileSync(rotFile, injectLine('r9', quoted('9')), 'utf8')
+  const afterRotate = readAggregate(rotFile, {})
+  check(
+    'readAggregate: 轮转后主文件变小即重置，只读新文件',
+    afterRotate.log.lines === 1 && afterRotate.injects.total === 1 && afterRotate.recent.at(-1).inj === 'r9',
+    'lines=' + afterRotate.log.lines + ' inj=' + (afterRotate.recent.at(-1) || {}).inj
+  )
+
+  rmSync(dir, { recursive: true, force: true })
+}
 const failed = results.filter((r) => !r.pass)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 if (failed.length > 0) {

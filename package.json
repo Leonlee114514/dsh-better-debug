@@ -1,7 +1,7 @@
 {
   "name": "dsh-better-debug",
-  "version": "0.3.4",
-  "description": "面向编码场景的卡住检测：以事件流中的行为证据（盲改 / 重复报错 / 错误族 / 验证振荡 / 补丁链 / 干预失效）在下一步前注入观察与恢复建议。不读模型文本、不调 LLM 的 DeepSeek Harness 插件。",
+  "version": "0.3.5",
+  "description": "当Coding Agent遇到方法论失效、reasoning僵化、被难题卡住或持续打转时的over-commitment/blind commitment/Einstellung effect检测与修正：用事件流里的行为证据（盲改 / 重复报错 / 错误族 / 验证振荡 / 补丁链 / 干预失效）判断是否陷入无效迭代与更改，并在下一步前注入一条观察与转向建议，使模型自觉进行intention reconsideration（意图重考虑）。不调 LLM、不改 agent loop、不解析模型输出。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -13,6 +13,8 @@
     "lib/",
     "assets/",
     "web/",
+    "test/",
+    "scripts/",
     "client.js",
     "cordis.patch.yml",
     "README.md",
@@ -23,6 +25,8 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
+    "coding-agent",
+    "stuck-loop",
     "debugging",
     "agent-hygiene",
     "pre-step"
@@ -40,7 +44,8 @@
     "client": {
       "platform": "web",
       "inject": [
-        "slots"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale"
       ]
     }
   },
@@ -49,12 +54,16 @@
     "dsh": ">=0.2.1-rc.5"
   },
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js && node --check test/sim.mjs && node --check test/panel.mjs && node --check test/posix/register.mjs && node --check test/posix/hooks.mjs && node --check test/posix/path.mjs && node --check test/linux/register.mjs && node --check test/slow/register.mjs && node --check test/slow/fs.mjs",
-    "test:unit": "node test/sim.mjs && node test/panel.mjs",
+    "judge-health": "node scripts/judge-health.mjs",
+    "pack-check": "node scripts/pack-check.mjs",
+    "prepack": "node scripts/pack-check.mjs",
+    "lint": "node scripts/lint.mjs",
+    "check": "node --check scripts/pack-check.mjs && node --check scripts/lint.mjs && node --check scripts/judge-health.mjs && node --check lib/index.js && node --check lib/panel.js && node --check lib/text.js && node --check client.js && node --check test/sim.mjs && node --check test/panel.mjs && node --check test/posix/register.mjs && node --check test/posix/hooks.mjs && node --check test/posix/path.mjs && node --check test/linux/register.mjs && node --check test/slow/register.mjs && node --check test/slow/fs.mjs && node --check test/client.mjs",
+    "test:unit": "node test/sim.mjs && node test/panel.mjs && node test/client.mjs && node scripts/judge-health.mjs test/fixtures/better-debug.sample.log",
     "test:posix": "node --import ./test/posix/register.mjs test/sim.mjs && node --import ./test/posix/register.mjs test/panel.mjs",
     "test:linux": "node --import ./test/linux/register.mjs test/sim.mjs && node --import ./test/linux/register.mjs test/panel.mjs",
     "test:slow": "node --import ./test/slow/register.mjs test/panel.mjs",
     "test": "npm run test:unit && npm run test:posix && npm run test:linux && npm run test:slow",
-    "verify": "npm run check && npm test"
+    "verify": "npm run check && npm run lint && npm run pack-check && npm test"
   }
 }

@@ -16,6 +16,10 @@ import {
   errorTargetOf,
   failureSetOf,
   failureSetKey,
+  failureTargetsOf,
+  measureKey,
+  createMeasureSettler,
+  createDeliverer,
   exitCodeOf,
   isAbsPath,
   resolveLogFile,
@@ -174,6 +178,51 @@ const shell = (id, { command = 'ls -la', exit = 0 } = {}) =>
 const fail = (id, text, toolName = 'ops_read_files') =>
   tool(id, toolName, { text, isError: true })
 
+/**
+ * 一次 PTC 派发：根 run_code 的 tool/call，中间两次 log-only 的
+ * tool/ptc-dispatch-start / tool/ptc-dispatch，最后根 tool/result。
+ * 形状照抄 dsh-tool-executor-ptc（subCallId = `<root>:ptc:<n>`）。
+ */
+const ptc = (rootId, subName, subId, { args = {}, text = '', isError = false, rootText, rootError, code = 'x' } = {}) =>
+  async (session, ctx, step) => {
+    await ctx.emitPlain('session/event', session, {
+      type: 'tool/call',
+      data: { turn: 1, step, callId: rootId, name: 'run_code', arguments: { code, description: 'y' } }
+    })
+    await ctx.emitPlain('session/event', session, {
+      type: 'tool/ptc-dispatch-start',
+      data: { rootCallId: rootId, parentCallId: rootId, subCallId: subId, name: subName, arguments: args }
+    })
+    await ctx.emitPlain('session/event', session, {
+      type: 'tool/ptc-dispatch',
+      data: {
+        rootCallId: rootId,
+        parentCallId: rootId,
+        subCallId: subId,
+        name: subName,
+        arguments: args,
+        isError,
+        content: text
+      }
+    })
+    const rootIsError = rootError === void 0 ? isError : rootError
+    await ctx.emitPlain('session/event', session, {
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step,
+        message: {
+          id: `m-${rootId}`,
+          role: 'tool',
+          toolCallId: rootId,
+          isError: rootIsError,
+          source: { kind: 'tool', callId: rootId },
+          content: [{ type: 'text', text: rootText === void 0 ? (rootIsError ? text : '') : rootText }]
+        }
+      }
+    })
+  }
+
 const has = (injected, needle) => injected.find((entry) => entry.texts.some((t) => t.includes(needle)))
 
 /** 注入摘要：`step:信号` 列表，比光看条数更容易定位是哪个信号说的话。 */
@@ -314,13 +363,18 @@ const injections = (injected) =>
 }
 
 // ── 9. B 信号：同一目标同一指纹，两次
+//
+// 位置漂移写成 `:42:5` / `:99:5`（0.3.6 口径）：这两段由 <path> 规则整段吃掉，
+// 所以「同一个错、只是行号变了」仍然合并。旧夹具写的是 `line 42` / `line 99`，
+// 那两个数字不在路径里、属于正文，新口径下会被当成不同的失败语义 —— 那是刻意的，
+// 行号在正文里时就该分开（见组 66 的反例与组 65 的正例）。
 {
   const ctx = makeCtx()
   apply(ctx, { logFile: '' })
   const agent = { session: makeSession() }
   const steps = [
-    [(s, c, st) => fail('c1', "Error: ENOENT: no such file or directory, open 'C:/work/a.js' line 42")(s, c, st)],
-    [(s, c, st) => fail('c2', "Error: ENOENT: no such file or directory, open 'C:/work/a.js' line 99")(s, c, st)],
+    [(s, c, st) => fail('c1', "Error: ENOENT: no such file or directory, open 'C:/work/a.js:42:5'")(s, c, st)],
+    [(s, c, st) => fail('c2', "Error: ENOENT: no such file or directory, open 'C:/work/a.js:99:5'")(s, c, st)],
     []
   ]
   const injected = await runTurn(ctx, agent, { turn: 1, steps })
@@ -389,22 +443,79 @@ const injections = (injected) =>
   check('C: 改完之后只在读东西 → 不打断', injected.length === 0, `injections=${injected.length}`)
 }
 
-// ── 14. C 正中例：arm 之后又写了一次 → 注入
+// ── 14. C 的判据是「盲改次数」，不是「距上次改过了几步」（0.3.5 换轴）
+//
+// 旧判据 step - lastEditStep 的两种失效方式，下面两条反例各钉一个：
+//   · 每步都改 → 差值恒为 1，永不触发（漏报）；
+//   · 改 → 读一眼 → 改 → 差值恒为 2，立刻上膛（误报）。
+// 实测 20 天日志里 182 条 arm 行的 gap 全部等于 2（唯一值），正是这个错轴的指纹。
 {
+  // 14a. 改 → 读 → 改：只有 2 次盲改，不该上膛，更不该开口。
   const ctx = makeCtx()
   apply(ctx, { logFile: '' })
   const agent = { session: makeSession() }
-  const P = 'C:/work/src/no-verify.js'
+  const P = 'C:/work/src/read-between.js'
   const steps = [
     [(s, c) => edit(P)(s, c)],
-    [],
-    [],
+    [(s, c, st) => tool('r1', 'ops_read_files', { args: { path: P } })(s, c, st)],
     [(s, c) => edit(P)(s, c)],
     []
   ]
   const injected = await runTurn(ctx, agent, { turn: 1, steps })
-  const hit = has(injected, '上次改完')
-  check('C: 上膛后又动手 → 注入', hit !== void 0, hit ? `step=${hit.step}` : 'no injection')
+  check('C: 改→读→改（2 次盲改）不响', injected.length === 0, `injections=${injected.length}`)
+}
+
+{
+  // 14b. 改 → 读三次 → 改：读数次再多也不推进判据（旧轴会一路把 gap 顶上去）。
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const P = 'C:/work/src/read-more.js'
+  const steps = [
+    [(s, c) => edit(P)(s, c)],
+    [(s, c, st) => tool('r1', 'ops_read_files', { args: { path: P } })(s, c, st)],
+    [(s, c, st) => tool('r2', 'ops_read_files', { args: { path: P } })(s, c, st)],
+    [(s, c, st) => tool('r3', 'ops_read_files', { args: { path: P } })(s, c, st)],
+    [(s, c) => edit(P)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('C: 改→读×3→改（仍只有 2 次盲改）不响', injected.length === 0, `injections=${injected.length}`)
+}
+
+{
+  // 14c. 跨文件连写 4 处、一次没测 → 必须响（正例：这才是 C 要抓的现场）。
+  // 每个文件只改一次，所以 A（同文件连改 3 次）不会命中，命中的只能是 C。
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const steps = [
+    [(s, c) => edit('C:/work/src/a.js')(s, c)],
+    [(s, c) => edit('C:/work/src/b.js')(s, c)],
+    [(s, c) => edit('C:/work/src/c.js')(s, c)],
+    [(s, c) => edit('C:/work/src/d.js')(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '自上次测量以来')
+  check('C: 跨文件盲改 4 处 → 注入', hit !== void 0, hit ? `step=${hit.step}` : 'no injection')
+}
+
+{
+  // 14d. 改×2 → 测量 → 改：测量把计数清零，第三次写入不够阈值，不响。
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const P = 'C:/work/src/measured.js'
+  const steps = [
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    [(s, c, st) => measure('v1')(s, c, st)],
+    [(s, c) => edit(P)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  check('C: 改×2→测量→改 不响（测量清零盲改计数）', injected.length === 0, `injections=${injected.length}`)
 }
 
 // ── 15. 评审第 5 条：A 提醒 → 有效测量恢复 → 新阶段再盲改，允许第二次提醒
@@ -451,12 +562,15 @@ const injections = (injected) =>
   const ctx = makeCtx()
   apply(ctx, { logFile: '' })
   const agent = { session: makeSession() }
-  const P = 'C:/work/src/present-fail.js'
+  // 判据换轴后这里要用「够阈值的盲改次数」而不是「隔了一步」，否则测不出 done 有没有被置上。
+  // 每个文件只改一次，避免 A 先命中把 C 挡掉（C 与 A 互斥）。
   const steps = [
-    [(s, c, st) => edit(P)(s, c)],
+    [(s, c) => edit('C:/work/src/pf-a.js')(s, c)],
     [(s, c, st) => tool('p1', 'present', { text: 'present rejected: no such file', isError: true })(s, c, st)],
-    [],
-    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit('C:/work/src/pf-b.js')(s, c)],
+    [(s, c) => edit('C:/work/src/pf-c.js')(s, c)],
+    [(s, c) => edit('C:/work/src/pf-d.js')(s, c)],
+    [(s, c) => edit('C:/work/src/pf-e.js')(s, c)],
     []
   ]
   const injected = await runTurn(ctx, agent, { turn: 1, steps })
@@ -513,6 +627,45 @@ const injections = (injected) =>
   ]
   const injected = await runTurn(ctx, agent, { turn: 1, steps, quietText: '别搜了，直接改' })
   check('D: 用户说直接改 → 静音', injected.length === 0, `injections=${injected.length}`)
+}
+// ── 20b. D 段例外必须中英双语：英文用户说同一句话，待遇必须一样。
+//     修复前 QUIET_PATTERN 只有中文条目，英文指令整句不识别 → 用户明确说
+//     "just do it, skip the search" 却继续被提醒，是最刺人的那种误报。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const P = 'C:/work/src/quiet-en.js'
+  const steps = [
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps, quietText: "just do it, don't search" })
+  check('D: 英文「just do it」同样静音', injected.length === 0, 'injections=' + injected.length)
+}
+
+// ── 20c. 反过来也要成立：描述性提到搜索不得静音（误静音比漏静音更贵）。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const P = 'C:/work/src/quiet-neg.js'
+  const steps = [
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    [(s, c) => edit(P)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, {
+    turn: 1,
+    steps,
+    quietText: 'I searched before editing, here is what I found'
+  })
+  check('D: 描述性提到搜索不静音（反例）', injected.length === 1, 'injections=' + injected.length)
 }
 
 // ── 21. 子会话不管
@@ -673,6 +826,13 @@ const injections = (injected) =>
     [isMeasurement('ops_bash', { command: 'ls -la' }, cfgLike) === false, 'ls 不是测量'],
     [isMeasurement('ops_bash', { command: 'npm test', description: 'x' }, cfgLike) === true, '命令命中即可'],
     [isMeasurement('lsp_diagnostics', {}, cfgLike) === true, 'lsp_diagnostics 恒为测量'],
+    // 反例：宿主没装 dsh-lsp-actions 时这个工具不存在，判定表不该因此变化 ——
+    // 但也**不能**把别的工具名当成硬测量。三个真正恒定的名字逐个钉住，
+    // 免得哪天有人把 verify 也一起删了还以为只是清理死代码。
+    [isMeasurement('verify', {}, cfgLike) === true, 'verify 恒为测量'],
+    [isMeasurement('run_tests', {}, cfgLike) === true, 'run_tests 恒为测量'],
+    [isMeasurement('run_test', {}, cfgLike) === true, 'run_test 恒为测量'],
+    [isMeasurement('ops_read_files', {}, cfgLike) === false, '只读工具不是测量'],
     [exitCodeOf('[exit code: 2]') === 2, 'exit code 解析'],
     [exitCodeOf('exited with status 1') === 1, 'exit status 解析'],
     [exitCodeOf('no code here') === void 0, '无退出码返回 undefined'],
@@ -964,7 +1124,13 @@ check(
     [[...measureDirs({ workdir: '/home/u', command: 'cd projB && npm test' })].sort(), ['/home/u', '/home/u/projB'].sort(), 'cd 相对路径靠 workdir 落地'],
     [[...measureDirs({ command: 'cd projB && npm test' })], [], 'cd 相对又没有 workdir → 不猜'],
     [[...measureDirs({ workdir: '/home/u/projB', command: 'npm test' })], ['/home/u/projB'], 'workdir 原样'],
-    [[...measureDirs({ command: 'npm test -- src/a.test.js' })], [], '测试文件路径不带绝对路径 → 不猜']
+    [[...measureDirs({ command: 'npm test -- src/a.test.js' })], [], '测试文件路径不带绝对路径 → 不猜'],
+    // Git Bash / MSYS 把 C 盘写成 /c：不归一就会和写入侧的 C:/ 永不相等（30j 的根因）。
+    [[...measureDirs({ command: 'cd /c/work/projB && npm test' })], ['c:/work/projB'], 'MSYS 盘符方言归一'],
+    [[...measureDirs({ command: 'cd /usr/local && npm test' })], ['/usr/local'], '首段不是单个字母 → 不动'],
+    // WSL 把 C 盘挂在 /mnt/c：同一台机器上 bash 走 WSL、写文件走 Windows 时同样不相交。
+    [[...measureDirs({ command: 'cd /mnt/c/work/projB && npm test' })], ['c:/work/projB'], 'WSL 挂载点方言归一'],
+    [[...measureDirs({ command: 'cd /mnt/data/x && npm test' })], ['/mnt/data/x'], '挂载点不是单个字母 → 不动']
   ]
   const bad = cases
     .filter(([actual, expected]) => !sameDirs(actual, expected))
@@ -1124,8 +1290,11 @@ check(
     [(s, c) => edit(file)(s, c)],
     [(s, c) => edit(file)(s, c)],
     [(s, c) => edit(file)(s, c)],
-    [(s, c, st) => fail('m1', stack)(s, c, st)], // 第 4 步 pre-step 落 A
-    [(s, c, st) => fail('m2', stack)(s, c, st)],
+    // 第一动作必须是「既非 verify/search/method 也不在 READ_TOOLS」的调用，
+    // 否则它本身就是转向，futile 会被清零、M 永远攒不出来（0.3.6 起读文件算转向）。
+    // ops_write 归 edit，正好符合「带病继续改」的语义。
+    [(s, c, st) => fail('m1', stack, 'ops_write')(s, c, st)], // 第 4 步 pre-step 落 A
+    [(s, c, st) => fail('m2', stack, 'ops_write')(s, c, st)],
     [(s, c, st) => shell('m3')(s, c, st)], // 第 6 步 pre-step 落 B
     [(s, c) => edit(file)(s, c)],
     [(s, c) => edit(file)(s, c)],
@@ -1144,7 +1313,7 @@ check(
     metas.length === 1 &&
       !metas[0].texts.some(
         (t) =>
-          t.includes('同一个文件连续改了') ||
+          t.includes('同一个文件累计改了') ||
           t.includes('同一个操作重复报错') ||
           t.includes('种不同报错') ||
           t.includes('翻转了') ||
@@ -1756,6 +1925,42 @@ check(
   )
 }
 
+// ── 53b. 解析不出条目的失败测量也要推进幂等状态（P1-11 / A4）
+//
+// 与 53 的区别：那一条的失败**能解析出条目**（failSetKey 非空，episode 会记账）。
+// 这一条故意用解析不出任何失败行的输出（只有 `[exit code: 1]`，真实里对应 vitest
+// 崩溃、输出被截断、reporter 换了格式），此时没有 episode、B 天然数不到。
+// 唯一还能说话的是 A：streakEdits 保留（decayEditsOnVerify=false），一次失败测量
+// 之后 fired.A 归零，同一份「改了 3 次」仍然成立 → 应该再说一次。
+// 闸门若因为 failSeq 没动而判「什么都没变」，第二次 A 就被自己挡掉（实测只注入 1 次）。
+//
+// 这条是 P1-11 的验收：failSeq 必须**无条件**推进，不挂在 failSetKey !== '' 里面。
+{
+  const ctxB = makeCtx()
+  apply(ctxB, { logFile: '', decayEditsOnVerify: false })
+  const agentB = { session: makeSession() }
+  const opaque = '[exit code: 1]'
+  const steps = [
+    [(s, c) => edit('C:/work/src/p1.js')(s, c)],
+    [(s, c) => edit('C:/work/src/p1.js')(s, c)],
+    [(s, c) => edit('C:/work/src/p1.js')(s, c)],
+    [(s, c) => runFail('pf-1', opaque)(s, c)],
+    []
+  ]
+  const injected = await runTurn(ctxB, agentB, { turn: 1, steps })
+  const hits = injected.filter((entry) => entry.texts.some((t) => t.includes('同一个文件累计改了')))
+  check(
+    'P1-11：失败测量解析不出条目，也要推进幂等状态（第二次 A 不得被挡）',
+    hits.length === 2,
+    `steps=${hits.map((h) => h.step).join(',') || '-'} setSize=${failureSetOf(opaque).size}`
+  )
+  check(
+    'P1-11：该夹具确实解析不出条目（否则测的不是这条路径）',
+    failureSetOf(opaque).size === 0,
+    `size=${failureSetOf(opaque).size}`
+  )
+}
+
 // ── 54. 第三轮深审：位置归一化与诊断类型（0.3.3 的五个缺陷）
 //
 // 这一组全部是**解析层**的断言：它们不看注入，只看 `failureSetOf` / `errorTargetOf`
@@ -1868,6 +2073,1624 @@ check(
     `size=${failureSetOf(pytest('case-one')).size}`)
 }
 
+// ── 55. 第四轮深审：路径方言、诊断类型与归属（0.3.4 的六组缺陷）
+//
+// 这一组和前几组的区别：不再只验「目标抽得对不对」，而是直接验**失败集合的身份**。
+// 第三轮的五处修复都停在目标层，于是「目标认得出、身份认不出」的缺陷一路留到第四轮 ——
+// 用例 46 验了 errorTargetOf 认 webpack 位置，却没人验 webpack 的集合身份在行号漂移后不变。
+{
+  // 55a 非 ASCII 路径（缺陷 A）。0.3.4 的路径原子是 ASCII 单词字符类，
+  // C:/work/项目/src/a.ts 只截到 C:/work/，测试.ts(12,9) 直接截成空串。
+  const zhAbs = (n) => 'C:/work/项目/src/a.ts(' + n + ',9): error TS2322: 类型不匹配'
+  check(
+    '中文绝对路径：目标必须完整',
+    samePath(errorTargetOf(zhAbs(12)), 'C:/work/项目/src/a.ts'),
+    'actual=' + errorTargetOf(zhAbs(12))
+  )
+  check(
+    '中文绝对路径：仅行号漂移 → 同一集合',
+    failureSetKey(failureSetOf(zhAbs(12))) === failureSetKey(failureSetOf(zhAbs(13))),
+    failureSetKey(failureSetOf(zhAbs(12))) + ' vs ' + failureSetKey(failureSetOf(zhAbs(13)))
+  )
+  check(
+    '中文裸文件名：目标必须是文件名本身',
+    samePath(errorTargetOf('测试.ts(12,9): error TS2322'), '测试.ts'),
+    'actual=' + errorTargetOf('测试.ts(12,9): error TS2322')
+  )
+  check(
+    '两个不同中文文件不得塌成同一目标',
+    !samePath(errorTargetOf('C:/work/项目/a.ts(12,9): error'), errorTargetOf('C:/work/项目/b.ts(12,9): error')),
+    errorTargetOf('C:/work/项目/a.ts(12,9): error') + ' vs ' + errorTargetOf('C:/work/项目/b.ts(12,9): error')
+  )
+
+  // 55b 带空格裸文件名（缺陷 B）。0.3.4 只吃 ASCII 单词字符，my file.ts 塌成 file.ts，
+  // 于是三个不同文件变成同一个目标：P 把「逐个修独立文件」误报成补丁链。
+  const spacedBare = (name) => name + '(12,9): error TS2322: not assignable'
+  check(
+    '带空格裸文件名：目标必须完整（不能塌成 file.ts）',
+    samePath(errorTargetOf(spacedBare('my file.ts')), 'my file.ts'),
+    'actual=' + errorTargetOf(spacedBare('my file.ts'))
+  )
+  const spacedSets = ['my file.ts', 'other file.ts', 'third file.ts'].map((name) => failureSetOf(spacedBare(name)))
+  check(
+    '三个带空格文件名互不相同（否则 P 会把逐个修文件读成补丁链）',
+    new Set(spacedSets.map((set) => failureSetKey(set))).size === 3,
+    spacedSets.map((set) => [...set][0]).join(' , ')
+  )
+  check(
+    '带空格裸文件名：仅行号漂移 → 同一集合',
+    failureSetKey(failureSetOf(spacedBare('my file.ts'))) ===
+      failureSetKey(failureSetOf('my file.ts(13,9): error TS2322: not assignable')),
+    failureSetKey(failureSetOf(spacedBare('my file.ts')))
+  )
+
+  // 55c 附注不是失败（缺陷 C）。mypy 的 note 带同一个路径、紧跟在 error 后面，
+  // 「含路径就进集合」把它收成第二条条目：error 一字未变、只有 note 文案在变，集合每轮不同。
+  const mypy = (extra) => ['src/a.py:10: error: Incompatible return value type', extra].filter((line) => line.length > 0).join('\n')
+  check(
+    'mypy：增删 note 不得改变集合',
+    failureSetKey(failureSetOf(mypy(''))) === failureSetKey(failureSetOf(mypy('src/a.py:10: note: See first for the original declaration'))),
+    failureSetOf(mypy('src/a.py:10: note: See first')).size + ' 条'
+  )
+  check(
+    'mypy：note 文案变化不得改变集合',
+    failureSetKey(failureSetOf(mypy('src/a.py:10: note: See first'))) ===
+      failureSetKey(failureSetOf(mypy('src/a.py:10: note: See second'))),
+    failureSetKey(failureSetOf(mypy('src/a.py:10: note: See first')))
+  )
+  check(
+    'mypy：真正新增第二条 error 仍必须改变集合',
+    failureSetOf(mypy('') + '\nsrc/b.py:3: error: Name x is not defined').size === 2,
+    'size=' + failureSetOf(mypy('') + '\nsrc/b.py:3: error: Name x is not defined').size
+  )
+  // note 里常挂文档链接，https://… 的 s:// 形状上就是一个盘符路径 ——
+  // 抽出来会得到 s://mypy.readthedocs.io/... 这种「目标」，同一处 error 只因链接不同就换目标。
+  check(
+    'note 里的 URL 不得被当成路径目标',
+    errorTargetOf('src/a.py:10: note: See https://mypy.readthedocs.io/en/stable/x.html#y') === '' ||
+      samePath(errorTargetOf('src/a.py:10: note: See https://mypy.readthedocs.io/en/stable/x.html#y'), 'src/a.py'),
+    'actual=' + errorTargetOf('src/a.py:10: note: See https://mypy.readthedocs.io/en/stable/x.html#y')
+  )
+
+  // 55d 测试用例作用域（缺陷 D）。同一文件、同一行、同一句 assert False，只有用例名不同，
+  // 用例名不进身份就塌成一条：健康 TDD 每轮新增用例被读成「旧失败回来了」，O 数到翻转。
+  const pytestCase = (name, line = 10) => [
+    'tests/test_a.py:' + line + ': in ' + name,
+    '    def ' + name + '():',
+    '>       assert False',
+    'E       assert False',
+    'FAILED tests/test_a.py::' + name + ' - assert False'
+  ].join('\n')
+  check(
+    'pytest：不同用例即使断言文本相同也必须是不同身份',
+    failureSetKey(failureSetOf(pytestCase('test_one'))) !== failureSetKey(failureSetOf(pytestCase('test_two'))),
+    failureSetKey(failureSetOf(pytestCase('test_one'))) + ' vs ' + failureSetKey(failureSetOf(pytestCase('test_two')))
+  )
+  check(
+    'pytest：同一用例仅行号漂移 → 同一集合',
+    failureSetKey(failureSetOf(pytestCase('test_one'))) === failureSetKey(failureSetOf(pytestCase('test_one', 20))),
+    failureSetKey(failureSetOf(pytestCase('test_one')))
+  )
+  check(
+    'pytest：用例名只折进指纹，不新增条目',
+    failureSetOf(pytestCase('test_one')).size === 1,
+    'size=' + failureSetOf(pytestCase('test_one')).size
+  )
+
+  // 55e 异常与栈帧的归属（缺陷 E）。早期只记「最近一条栈帧」，于是
+  // AssertionError / at a / AssertionError / at b 里第二条沿用了第一条的目标，
+  // 两个不同文件上的两条异常塌成一条 —— 真实收缩被读成「同一个错误没变」。
+  const twoAssert = ['AssertionError: shared', '    at C:/work/test/a.test.mjs:4:9', 'AssertionError: shared', '    at C:/work/test/b.test.mjs:4:9'].join('\n')
+  const onlyA = ['AssertionError: shared', '    at C:/work/test/a.test.mjs:4:9'].join('\n')
+  check(
+    '两条同消息不同文件的断言 → 两条条目',
+    failureSetOf(twoAssert).size === 2,
+    'size=' + failureSetOf(twoAssert).size
+  )
+  check(
+    '收缩到只剩一条时，剩下的那条与单独出现时同一身份',
+    failureSetKey(failureSetOf(twoAssert)) !== failureSetKey(failureSetOf(onlyA)) &&
+      [...failureSetOf(onlyA)].every((item) => failureSetOf(twoAssert).has(item)),
+    [...failureSetOf(onlyA)].join(' , ')
+  )
+  // 作用域不能跨诊断块继承：pytest 块之后的裸 V8 异常若被染上 ::test_one，
+  // 同一个错误在「输出里有没有 pytest 块」两种情形下会得到两个身份。
+  const mixedBlocks = [pytestCase('test_one'), 'AssertionError: shared', '    at C:/work/test/a.test.mjs:4:9'].join('\n\n')
+  // 断言的是**子集**而不是相等：pytest 块自己还有一条条目，两块合起来当然是两条。
+  // 要证明的是「裸异常的身份与它前面有没有 pytest 块无关」—— 被染上 ::test_one 时
+  // 这条子集关系就不成立。
+  const mixedSet = failureSetOf(mixedBlocks)
+  check(
+    '作用域不得跨诊断块继承（裸异常的身份与上下文无关）',
+    [...failureSetOf(onlyA)].every((item) => mixedSet.has(item)),
+    [...failureSetOf(onlyA)].join(' , ') + ' ⊄ ' + [...mixedSet].join(' , ')
+  )
+
+  // 55f 普通 Error 不是聚合行（缺陷 F）。AGGREGATE_LINE 的 \d* 可空，
+  // 于是 Error: shared 被当成「1 errors」吞掉，3 个错误缩到 2 个时集合形状完全错位。
+  const jsError = (name) => 'Error: ' + name + '\n    at C:/work/test/' + name + '.test.mjs:1:1'
+  check(
+    '普通 Error：3 → 2 → 1 必须表现为条目数 3、2、1',
+    failureSetOf([jsError('a'), jsError('b'), jsError('c')].join('\n')).size === 3 &&
+      failureSetOf([jsError('a'), jsError('b')].join('\n')).size === 2 &&
+      failureSetOf(jsError('a')).size === 1,
+    'sizes=' + [
+      failureSetOf([jsError('a'), jsError('b'), jsError('c')].join('\n')).size,
+      failureSetOf([jsError('a'), jsError('b')].join('\n')).size,
+      failureSetOf(jsError('a')).size
+    ].join(',')
+  )
+  check(
+    '普通 Error：Error: 开头的行不得被聚合规则吞掉',
+    failureSetOf('Error: shared').size === 1,
+    'size=' + failureSetOf('Error: shared').size
+  )
+  check(
+    '真实聚合行仍被排除（error 本体不变，只多一行统计）',
+    failureSetKey(failureSetOf('src/a.ts(12,9): error TS2322: nope')) ===
+      failureSetKey(failureSetOf('src/a.ts(12,9): error TS2322: nope\n\u2716 1 problem (1 error, 0 warnings)')),
+    'size=' + failureSetOf('src/a.ts(12,9): error TS2322: nope\n\u2716 1 problem (1 error, 0 warnings)').size
+  )
+  // webpack 的 ERROR in ./x 5:0-20 是**位置头**，不是失败本体：
+  // 位置已经由 cutLocatorAt 剥掉，整行进集合会让同一错误在行号漂移后多出一条。
+  const webpackAt = (n) => 'ERROR in ./src/index.js ' + n + ':0-20\nModule build failed: Unexpected token'
+  check(
+    'webpack：位置头不进条目（集合只含模块构建失败那一条）',
+    failureSetOf(webpackAt(5)).size === 1 &&
+      failureSetKey(failureSetOf(webpackAt(5))) === failureSetKey(failureSetOf(webpackAt(6))),
+    'size=' + failureSetOf(webpackAt(5)).size + ' ' + [...failureSetOf(webpackAt(5))].join(' , ')
+  )
+
+  // 55g 全绿输出不产条目。看着像小事，实际是「失败集合」的语义底线：
+  // 一份没有任何失败的输出若还返回一条条目，O/B 两个信号会把「测试全绿」当失败计数，
+  // 而且这条假条目每次行号一变就换个指纹，反复触发「新失败」。
+  const greenJest = [
+    'PASS src/a.test.js',
+    '  \u2713 handles TypeError gracefully (3 ms)',
+    '  \u2713 rejects bad input (2 ms)',
+    '',
+    'Tests: 2 passed, 2 total'
+  ].join('\n')
+  check(
+    '全绿输出（jest 通过行 + 汇总）不得产出任何失败条目',
+    failureSetOf(greenJest).size === 0,
+    [...failureSetOf(greenJest)].join(' , ') || '(empty)'
+  )
+  check(
+    '单个通过行（TAP ok N / vitest 勾）不得产出失败条目',
+    failureSetOf('ok 1 - parses input').size === 0 &&
+      failureSetOf('  \u2713 handles TypeError gracefully').size === 0,
+    'tap=' + failureSetOf('ok 1 - parses input').size + ' vitest=' + failureSetOf('  \u2713 handles TypeError gracefully').size
+  )
+  check(
+    '只有聚合行时不得产出失败条目（统计不是失败）',
+    failureSetOf('\u2716 10 problems (10 errors, 0 warnings)').size === 0,
+    [...failureSetOf('\u2716 10 problems (10 errors, 0 warnings)')].join(' , ') || '(empty)'
+  )
+  // 反面：全绿里混一条真失败，条目只能是那一条 —— 排除逻辑不能把失败一起排掉。
+  const failOnly =
+    '  \u2717 rejects bad input\n    expect(received).toBe(expected)\n    at Object.<anonymous> (C:/w/a.test.js:5:9)'
+  const greenPlusOne = greenJest + '\n  \u2717 rejects bad input\n    expect(received).toBe(expected)\n    at Object.<anonymous> (C:/w/a.test.js:5:9)'
+  check(
+    '全绿里混一条真失败时，只报那一条（排除不能吃掉失败）',
+    failureSetKey(failureSetOf(greenPlusOne)) === failureSetKey(failureSetOf(failOnly)),
+    [...failureSetOf(greenPlusOne)].join(' , ')
+  )
+  // PASS_THROUGH 这类以 PASS 开头但不是通过行的 token 不能被行首锚定误伤。
+  check(
+    'PASS_THROUGH error 仍算失败（PASS_LINE 只吃行首独立的 PASS）',
+    failureSetOf('PASS_THROUGH error at src/a.js:1:1').size === 1,
+    [...failureSetOf('PASS_THROUGH error at src/a.js:1:1')].join(' , ')
+  )
+  // 55h 全绿的**套件形态**同样不产条目。node:test 的 spec reporter、mocha、vitest
+  // 各有一套不带冒号的统计行；早期只认 `Tests: 2 passed` 这种带冒号写法，于是全绿的
+  // mocha / vitest / node:test 运行仍各造一条假条目，而且套件名或耗时一改就换指纹 ——
+  // 「测试全绿」被读成「有失败」，还每轮都是「新失败」。
+  const greenNodeTest = [
+    'TAP version 13',
+    '\u25b6 TypeError handling',
+    '  \u2714 works (1ms)',
+    '  \u2139 tests 2',
+    '  \u2139 pass 2',
+    '  \u2139 fail 0',
+    '  \u2139 duration_ms 5.1',
+    '\u2714 TypeError handling (5.1ms)'
+  ].join('\n')
+  const greenMocha = ['  my suite', '    \u2714 works (2ms)', '  1 passing (5ms)'].join('\n')
+  const greenVitest = [' Test Files  1 passed (1)', '      Tests  2 passed (2)'].join('\n')
+  check(
+    'node:test / mocha / vitest 的全绿输出也不得产出失败条目',
+    failureSetOf(greenNodeTest).size === 0 &&
+      failureSetOf(greenMocha).size === 0 &&
+      failureSetOf(greenVitest).size === 0,
+    'node:test=' + ([...failureSetOf(greenNodeTest)].join(' , ') || '(empty)') +
+      ' mocha=' + ([...failureSetOf(greenMocha)].join(' , ') || '(empty)') +
+      ' vitest=' + ([...failureSetOf(greenVitest)].join(' , ') || '(empty)')
+  )
+  // 套件标题里的异常类型名（`\u25b6 TypeError handling`）只是词，不是失败：
+  // 类型名只有在「类型名 + 冒号或行尾」的消息形态下才算信号。改了套件名不该换身份。
+  check(
+    '套件名里的异常类型名不算失败，改名也不换身份',
+    failureSetOf(greenNodeTest).size === failureSetOf(greenNodeTest.split('TypeError').join('RangeError')).size &&
+      failureSetKey(failureSetOf(greenNodeTest)) === failureSetKey(failureSetOf(greenNodeTest.split('TypeError').join('RangeError')))
+  )
+  // 反面：真正的异常消息仍然是失败，收紧不能把这一层一起吃掉。
+  check(
+    'TypeError: x is not a function 仍是失败（收紧只针对套件标题）',
+    failureSetOf('TypeError: x is not a function\n    at foo (a.js:1:1)').size === 1,
+    [...failureSetOf('TypeError: x is not a function\n    at foo (a.js:1:1)')].join(' , ')
+  )
+}
+// ── 56. PTC 执行器（run_code）：子调用必须和普通工具一样被看见
+//
+// run_code 内部的每次 tools.xxx() 都不走 tool/call，只有 log-only 的
+// tool/ptc-dispatch-start / tool/ptc-dispatch。插件原先只认 tool/call，于是
+// 「用 run_code 写文件 / 跑测试 / 搜索」这一整层完全不可见：转向不算转向，
+// futile 假增长，M 报「提醒没换来转向」，而模型其实已经在跑了。
+{
+  const cfgLike = {
+    measureCommands: /(npm|pnpm)\s+(run\s+)?(test|verify)/i,
+    measureIntent: /验证|测试/i
+  }
+  // 根 run_code 的参数是 code 而不是 command。0.3.5 之前这里一律 false，
+  // 于是「在 run_code 里跑测试」既不算测量也解不开 C —— PTC 整层失明。
+  // 现在读 code 文本里的命令意图（measureCommands / measureIntent），
+  // 命中即算测量；measureDirs 同步从 code 里抽目录，避免一次
+  // 「顺手跑了个测试」把所有路径的盲改一起清零。
+  check(
+    'run_code 里的 npm test 算测量（读 code 文本里的命令意图）',
+    isMeasurement('run_code', { code: 'await tools.bash({command:"npm test"})', description: '跑测试' }, cfgLike) === true,
+    'isMeasurement(run_code)=' + isMeasurement('run_code', { code: 'await tools.bash({command:"npm test"})' }, cfgLike)
+  )
+  check(
+    'run_code 里没有测量意图的代码不算测量',
+    isMeasurement('run_code', { code: 'const x = 1 + 1' }, cfgLike) === false,
+    'isMeasurement(plain run_code)=' + isMeasurement('run_code', { code: 'const x = 1 + 1' }, cfgLike)
+  )
+  check(
+    'run_code 归类为 other（不冒充 verify / edit）',
+    classifyTool('run_code', false) === 'other' && classifyTool('run_code', true) === 'other',
+    classifyTool('run_code', true)
+  )
+
+  // 56a. PTC 子调用里的测量算转向：A 提醒之后在 run_code 里跑测试，
+  // 不得因为「看不见」而攒出无效注入、最后落 M。
+  {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const file = 'C:/work/src/ptc-a.js'
+    const steps = [
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [],
+      [(s, c, st) => ptc('rc1', 'ops_bash', 'rc1:ptc:1', { args: { command: 'npm test', description: '跑测试' }, text: '[exit code: 0]' })(s, c, st)],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps })
+    check(
+      'PTC: run_code 里跑测试算转向，不落 M',
+      injected.filter((e) => e.texts.some((t) => t.includes('元观察'))).length === 0,
+      'injections=' + injections(injected)
+    )
+  }
+
+  // 56b. PTC 子调用里的搜索同样算转向。
+  {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const steps = [
+      [(s, c) => edit('C:/work/src/ptc-b.js')(s, c)],
+      [(s, c) => edit('C:/work/src/ptc-b.js')(s, c)],
+      [(s, c) => edit('C:/work/src/ptc-b.js')(s, c)],
+      [],
+      [(s, c, st) => ptc('rc2', 'web_search', 'rc2:ptc:1', { args: { queries: ['x'] }, text: 'results' })(s, c, st)],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps })
+    check(
+      'PTC: run_code 里搜索算转向，不落 M',
+      injected.filter((e) => e.texts.some((t) => t.includes('元观察'))).length === 0,
+      'injections=' + injections(injected)
+    )
+  }
+
+  // 56c. PTC 子调用的失败要进 episode：同一个错两次仍然触发 B。
+  {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const boom = 'TypeError: boom is not a function'
+    const steps = [
+      [(s, c, st) => ptc('rc3', 'ops_read_files', 'rc3:ptc:1', { args: { path: 'C:/work/a.js' }, text: boom, isError: true })(s, c, st)],
+      [(s, c, st) => ptc('rc4', 'ops_read_files', 'rc4:ptc:1', { args: { path: 'C:/work/a.js' }, text: boom, isError: true })(s, c, st)],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps })
+    const hit = has(injected, '同一个操作重复报错')
+    check('PTC: 子调用里的同一个错两次 → B 仍然响', hit !== void 0, hit ? 'step=' + hit.step : 'no injection')
+  }
+
+  // 56d. 根 run_code 的 isError 只是子调用失败的回声：不能把同一次失败数成两次。
+  {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const boom = 'TypeError: echo is not a function'
+    const steps = [
+      [(s, c, st) => ptc('rc5', 'ops_read_files', 'rc5:ptc:1', { args: { path: 'C:/work/e.js' }, text: boom, isError: true })(s, c, st)],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps })
+    check(
+      'PTC: 一次子调用失败 + 根回声只算一次（不触发 B）',
+      has(injected, '同一个操作重复报错') === void 0,
+      'injections=' + injections(injected)
+    )
+  }
+
+  // 56e. 反面：真正的两次失败（两个不同的 run_code）仍然要数两次。
+  {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const boom = 'TypeError: twice is not a function'
+    const steps = [
+      [(s, c, st) => ptc('rc6', 'ops_read_files', 'rc6:ptc:1', { args: { path: 'C:/work/t.js' }, text: boom, isError: true })(s, c, st)],
+      [(s, c, st) => ptc('rc7', 'ops_read_files', 'rc7:ptc:1', { args: { path: 'C:/work/t.js' }, text: boom, isError: true })(s, c, st)],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps })
+    check(
+      'PTC: 两个根各自失败一次 → B 照常响（去重不能吃掉真重复）',
+      has(injected, '同一个操作重复报错') !== void 0,
+      'injections=' + injections(injected)
+    )
+  }
+
+  // 56f. PTC 子调用里的测量结果要清零盲改计数：A 不该在测量之后立刻再响。
+  {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const file = 'C:/work/src/ptc-c.js'
+    const steps = [
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [],
+      [(s, c, st) => ptc('rc8', 'ops_bash', 'rc8:ptc:1', { args: { command: 'npm test', workdir: 'C:/work', description: '跑测试' }, text: '[exit code: 0]' })(s, c, st)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps })
+    const hits = injected.filter((e) => e.texts.some((t) => t.includes('同一个文件')))
+    check(
+      'PTC: 子调用测量清零盲改计数（测量后只改 2 次不响）',
+      hits.length === 1,
+      'A 注入 ' + hits.length + ' 次'
+    )
+  }
+}
+// ── 57. 第五轮深审：路径方言、异常类型与帧归属（0.3.5 的五个缺陷）
+//
+// 这一组把第五轮探针里最容易被「优先级 / 方言 / 词表」三件事惄惄改坏的不变量固化成仓库内的断言：
+//   A 带空格的相对目录必须整段识别，不能因为「空格之后局部匹配成功」就提前返回；
+//   B 裸文件名向左回溯不限固定段数，但碰到诊断前缀词就停（ERROR in my file.ts）；
+//   C 方括号路由段是合法路径原子，绝对与相对都要完整，行号漂移不换身份；
+//   D E 行属于它前面那一帧，后面的帧属于下一条异常（pytest 方言）；
+//   E 异常类型名不能只列 JS 内置名，Python / Java 的类名同样是失败本体。
+{
+  const spacedRel = (root, line = 12) => root + '/src/a.ts(' + line + ',9): error TS2322: same failure'
+  const spacedAbs = (root, line = 12) => 'C:/work/' + root + '/src/a.ts(' + line + ',9): error TS2322: same failure'
+  const longBare = (name, line = 12) => name + '.ts(' + line + ',9): error TS2322: same failure'
+  const pytestCase = (file, testName, message = 'assert False', line = 10) => [
+    file + ':' + line + ': in ' + testName,
+    '    def ' + testName + '():',
+    '>       ' + message,
+    'E       ' + message,
+    'FAILED ' + file + '::' + testName + ' - ' + message
+  ].join('\n')
+  const pyTrace = (file, exc, line = 10) => [
+    'Traceback (most recent call last):',
+    '  File "C:/work/' + file + '.py", line ' + line + ', in test_case',
+    exc + ': shared'
+  ].join('\n')
+
+  // A. 带空格的相对目录。
+  check(
+    'A: 带空格的相对目录要整段识别',
+    samePath(errorTargetOf(spacedRel('my project')), 'my project/src/a.ts'),
+    'target=' + errorTargetOf(spacedRel('my project'))
+  )
+  check(
+    'A: 带空格的绝对目录同样整段识别',
+    samePath(errorTargetOf(spacedAbs('My Project')), 'C:/work/My Project/src/a.ts'),
+    'target=' + errorTargetOf(spacedAbs('My Project'))
+  )
+  check(
+    'A: 行号漂移不换身份',
+    failureSetKey(failureSetOf(spacedRel('my project', 12))) === failureSetKey(failureSetOf(spacedRel('my project', 13))),
+    'key=' + failureSetKey(failureSetOf(spacedRel('my project', 12)))
+  )
+  {
+    const keys = ['my project', 'other project', 'third project'].map((root) =>
+      failureSetKey(failureSetOf(spacedRel(root)))
+    )
+    check(
+      'A: 三个带空格的不同项目不得塔成同一目标',
+      new Set(keys).size === 3,
+      keys.join(' / ')
+    )
+  }
+
+  // B. 裸文件名的左回溯范围与停词。
+  check(
+    'B: 三段空格的裸文件名要整段识别',
+    samePath(errorTargetOf(longBare('my long file name')), 'my long file name.ts'),
+    'target=' + errorTargetOf(longBare('my long file name'))
+  )
+  check(
+    'B: 诊断前缀不得进入目标（ERROR in my file.ts）',
+    samePath(errorTargetOf('ERROR in my file.ts(12,9): error TS2322: same failure'), 'my file.ts'),
+    'target=' + errorTargetOf('ERROR in my file.ts(12,9): error TS2322: same failure')
+  )
+  {
+    const keys = ['my long file name', 'other long file name', 'third long file name'].map((n) =>
+      failureSetKey(failureSetOf(longBare(n)))
+    )
+    check(
+      'B: 三个不同的长文件名不得塔成同一目标',
+      new Set(keys).size === 3,
+      keys.join(' / ')
+    )
+  }
+  check(
+    'B: a.ts b.ts(12,9) 仍只取后一个文件',
+    samePath(errorTargetOf('a.ts b.ts(12,9): error TS2322: same failure'), 'b.ts'),
+    'target=' + errorTargetOf('a.ts b.ts(12,9): error TS2322: same failure')
+  )
+
+  // C. 方括号路由段。
+  const bracketAbs = (line = 12) => 'C:/work/app/[id]/page.tsx(' + line + ',9): error TS2322: same failure'
+  const bracketRel = (line = 12) => 'src/app/[id]/page.tsx(' + line + ',9): error TS2322: same failure'
+  check(
+    'C: 方括号的绝对路径要完整',
+    samePath(errorTargetOf(bracketAbs()), 'C:/work/app/[id]/page.tsx'),
+    'target=' + errorTargetOf(bracketAbs())
+  )
+  check(
+    'C: 方括号的相对路径要完整',
+    samePath(errorTargetOf(bracketRel()), 'src/app/[id]/page.tsx'),
+    'target=' + errorTargetOf(bracketRel())
+  )
+  check(
+    'C: [...slug] 这种展开写法同样是合法路由段',
+    samePath(errorTargetOf('src/app/[...slug]/page.tsx(12,9): error TS2322: same failure'), 'src/app/[...slug]/page.tsx'),
+    'target=' + errorTargetOf('src/app/[...slug]/page.tsx(12,9): error TS2322: same failure')
+  )
+  check(
+    'C: 行号漂移不换身份',
+    failureSetKey(failureSetOf(bracketAbs(12))) === failureSetKey(failureSetOf(bracketAbs(13))),
+    'key=' + failureSetKey(failureSetOf(bracketAbs(12)))
+  )
+  check(
+    'C: [id] 与 [...slug] 两个路由不得塔成同一目标',
+    failureSetKey(failureSetOf(bracketAbs(12))) !== failureSetKey(failureSetOf('src/app/[...slug]/page.tsx(12,9): error TS2322: same failure')),
+    'key=' + failureSetKey(failureSetOf(bracketAbs(12)))
+  )
+
+  // D. pytest 方言：帧在前，E 行在后，后面的帧不是自己的帧。
+  {
+    const twoSame = pytestCase('tests/a.py', 'test_one') + '\n' + pytestCase('tests/b.py', 'test_two', 'assert False', 20)
+    const onlyB = pytestCase('tests/b.py', 'test_two', 'assert False', 20)
+    const setTwo = failureSetOf(twoSame)
+    check(
+      'D: 两个连续的 pytest 失败要形成两条',
+      setTwo.size === 2,
+      'size=' + setTwo.size + ' items=' + [...setTwo].join(', ')
+    )
+    check(
+      'D: 收缩到只剩 B 是严格子集（不是同一个集合）',
+      failureSetKey(setTwo) !== failureSetKey(failureSetOf(onlyB)) && failureSetOf(onlyB).size === 1,
+      'keys=' + failureSetKey(setTwo) + ' vs ' + failureSetKey(failureSetOf(onlyB))
+    )
+  }
+  check(
+    'D: JS 第四轮形态（消息在前、at 帧在后）不回归',
+    failureSetOf('AssertionError: one\n    at C:/work/a.test.mjs:4:9\nAssertionError: two\n    at C:/work/b.test.mjs:4:9').size === 2,
+    'size=' + failureSetOf('AssertionError: one\n    at C:/work/a.test.mjs:4:9\nAssertionError: two\n    at C:/work/b.test.mjs:4:9').size
+  )
+
+  // E. 异常类型名不能只列 JS 内置名。
+  {
+    const pyNames = ['ValueError', 'KeyError', 'IndexError', 'AttributeError', 'ZeroDivisionError', 'ImportError']
+    const six = pyNames.map((exc, i) => pyTrace('f' + i, exc)).join('\n')
+    check(
+      'E: 六种 Python 异常各成一条（不得退成整段单条目）',
+      failureSetOf(six).size === 6,
+      'size=' + failureSetOf(six).size
+    )
+    const three = ['a', 'b', 'c'].map((f) => pyTrace(f, 'ValueError')).join('\n')
+    const two = ['a', 'b'].map((f) => pyTrace(f, 'ValueError')).join('\n')
+    const one = pyTrace('a', 'ValueError')
+    check(
+      'E: ValueError 的 3→2→1 是严格子集',
+      failureSetOf(three).size === 3 &&
+        failureSetOf(two).size === 2 &&
+        failureSetOf(one).size === 1 &&
+        [...failureSetOf(one)].every((item) => failureSetOf(two).has(item)) &&
+        [...failureSetOf(two)].every((item) => failureSetOf(three).has(item)),
+      'sizes=' + failureSetOf(three).size + ',' + failureSetOf(two).size + ',' + failureSetOf(one).size
+    )
+    check(
+      'E: JS TypeError 对照仍然是两条',
+      failureSetOf('TypeError: shared\n    at C:/work/a.test.mjs:10:1\nTypeError: shared\n    at C:/work/b.test.mjs:10:1').size === 2,
+      'size=' + failureSetOf('TypeError: shared\n    at C:/work/a.test.mjs:10:1\nTypeError: shared\n    at C:/work/b.test.mjs:10:1').size
+    )
+    check(
+      'E: 套件标题里的异常类型名不算失败',
+      failureSetOf('\u25b6 TypeError handling\n  \u2714 works (1ms)\n\u2139 fail 0').size === 0,
+      'size=' + failureSetOf('\u25b6 TypeError handling\n  \u2714 works (1ms)\n\u2139 fail 0').size
+    )
+  }
+
+  // 这三类常见误伤仍然不得因放宽词表而回来。
+  check(
+    'E: 文档 URL 不当路径（mypy note 里的链接）',
+    errorTargetOf('see https://mypy.readthedocs.io/en/stable/x.html for details') === '',
+    'target=' + JSON.stringify(errorTargetOf('see https://mypy.readthedocs.io/en/stable/x.html for details'))
+  )
+  // 兜底分支对「一条像样但抽不出路径的失败」仍会留一条无目标条目（整段哈希），
+  // 那是刻意的：宁可记一条不知道在哪的失败，也不要静默丢掉。这里要守住的是
+  // **别把分数当路径**，所以断言的是「没有任何条目带假目标」。
+  check(
+    'E: 分数与 and/or 不当路径（兜底条目不得带假目标）',
+    [...failureSetOf('7/8 and/or TCP/IP 12/25')].every((item) => item.startsWith('|')),
+    [...failureSetOf('7/8 and/or TCP/IP 12/25')].join(', ') || 'empty'
+  )
+}
+// ── 28b. 终审合同（第八轮）：路径候选裁决、TAP 元数据、pytest 进度行
+{
+  // 1. 路径候选裁决要看重叠与包含，不是“谁先命中谁赢”。
+  //    「src/项目/[...slug]/page.tsx》里那个裸 `/` 分支抢到的是后缀片段，
+  //    早先它一命中就不再计算相对路径，于是整条路径被截成 `/[...slug]/page.tsx`。
+  const routeUnicode = 'src/项目/[...slug]/page.tsx'
+  const routeCase = routeUnicode + '(12,9): error TS2322: same'
+  check(
+    '终审1: Unicode 目录 + 路由段的目标不得被截成后缀片段',
+    samePath(errorTargetOf(routeCase), routeUnicode),
+    'actual=' + JSON.stringify(errorTargetOf(routeCase))
+  )
+  check(
+    '终审1: 路由段目标行号漂移不换身份',
+    failureSetKey(failureSetOf(routeUnicode + '(12,9): error TS2322: same')) ===
+      failureSetKey(failureSetOf(routeUnicode + '(37,9): error TS2322: same')),
+    'keys=' + failureSetKey(failureSetOf(routeCase))
+  )
+  check(
+    '终审1: [id] 与 [...slug] 仍是不同目标',
+    !samePath(errorTargetOf(routeCase), errorTargetOf('src/app/[id]/page.tsx(12,9): error TS2322: same')),
+    'slug=' + JSON.stringify(errorTargetOf(routeCase)) + ' id=' + JSON.stringify(errorTargetOf('src/app/[id]/page.tsx(12,9): error TS2322: same'))
+  )
+  // 候选裁决改成通用规则后，这些已经对的形态一个也不能变。
+  const routeKeeps = [
+    ['ASCII 路由段', 'src/app/[id]/page.tsx(12,9): error TS2322: same', 'src/app/[id]/page.tsx'],
+    ['Windows 绝对 + 路由段', 'C:/work/app/[id]/page.tsx(12,9): error TS2322: same', 'C:/work/app/[id]/page.tsx'],
+    ['POSIX 带空格与 Unicode', '/home/me/我的 项目/src/a.ts:12:9: error TS2322: same', '/home/me/我的 项目/src/a.ts'],
+    ['带空格相对目录', 'my project/src/a.ts(12,9): error TS2322: same', 'my project/src/a.ts'],
+    ['带空格裸文件名', 'my long file name.ts(12,9): error TS2322: same', 'my long file name.ts'],
+    ['诊断前缀不进目标', 'ERROR in my file.ts(12,9): error TS2322: same', 'my file.ts']
+  ]
+  for (const [label, text, expected] of routeKeeps) {
+    check('终审1: 不回归 — ' + label, samePath(errorTargetOf(text), expected), 'actual=' + JSON.stringify(errorTargetOf(text)))
+  }
+  check(
+    '终审1: URL 与分数仍不当目标',
+    errorTargetOf('see https://mypy.readthedocs.io/en/stable/x.html') === '' &&
+      [...failureSetOf('7/8 and/or TCP/IP 12/25')].every((item) => item.startsWith('|')),
+    'url=' + JSON.stringify(errorTargetOf('see https://mypy.readthedocs.io/en/stable/x.html'))
+  )
+
+  // 2. TAP 是结构化协议：`# …` 是诊断注释、`1..1` 是计划、`---`/`...` 之间是 YAML 诊断块。
+  //    它们都不带路径，于是全漏进兜底分支，被当成一整段失败。
+  const tapGreenShort = ['TAP version 13', 'ok 1 - handles Error objects', '1..1'].join('\n')
+  check(
+    '终审2: TAP 简式全绿返回空集合',
+    failureSetOf(tapGreenShort).size === 0,
+    'items=' + [...failureSetOf(tapGreenShort)].join(',')
+  )
+  // 真实语料：node --test --test-reporter=tap 的原样输出。
+  const tapGreenReal = [
+    'TAP version 13',
+    '# Subtest: handles Error objects',
+    'ok 1 - handles Error objects',
+    '  ---',
+    '  duration_ms: 2.0705',
+    "  type: 'test'",
+    '  ...',
+    '1..1',
+    '# tests 1',
+    '# suites 0',
+    '# pass 1',
+    '# fail 0',
+    '# cancelled 0',
+    '# skipped 0',
+    '# todo 0',
+    '# duration_ms 269.2532'
+  ].join('\n')
+  check(
+    '终审2: 真实 Node TAP 全绿语料返回空集合',
+    failureSetOf(tapGreenReal).size === 0,
+    'items=' + [...failureSetOf(tapGreenReal)].join(',')
+  )
+  // 反例守卫：真失败不能因“排除元数据”而一并吞掉。
+  const tapFail = (ms) => [
+    'TAP version 13',
+    '# Subtest: adds numbers',
+    'not ok 1 - adds numbers',
+    '  ---',
+    '  duration_ms: ' + ms,
+    "  type: 'test'",
+    "  error: 'expected 3 to equal 4'",
+    '  ...',
+    '1..1',
+    '# tests 1',
+    '# pass 0',
+    '# fail 1'
+  ].join('\n')
+  check(
+    '终审2: TAP 真失败仍是一条',
+    failureSetOf(tapFail('2.0705')).size === 1,
+    'size=' + failureSetOf(tapFail('2.0705')).size + ' items=' + [...failureSetOf(tapFail('2.0705'))].join(',')
+  )
+  check(
+    '终审2: TAP 失败的耗时变化不换身份',
+    failureSetKey(failureSetOf(tapFail('2.0705'))) === failureSetKey(failureSetOf(tapFail('99.5'))),
+    failureSetKey(failureSetOf(tapFail('2.0705'))) + ' vs ' + failureSetKey(failureSetOf(tapFail('99.5')))
+  )
+  check(
+    '终审2: not ok 行本身不得被当成通过行吃掉',
+    failureSetOf('not ok 1 - actual failure').size === 1,
+    'size=' + failureSetOf('not ok 1 - actual failure').size
+  )
+
+  // 3. pytest 进度行：路径 + 点号进度记号，不是失败条目。
+  const pytestProgress = 'tests/test_a.py .. [100%]\n2 passed in 0.03s'
+  check(
+    '终审3: pytest 进度行返回空集合',
+    failureSetOf(pytestProgress).size === 0,
+    'items=' + [...failureSetOf(pytestProgress)].join(',')
+  )
+  const pytestProgressForms = [
+    'tests/test_a.py . [ 50%]',
+    'tests/test_a.py .F. [ 66%]',
+    'tests/test_a.py s [ 10%]',
+    'tests/test_a.py::test_one PASSED [ 50%]',
+    'tests/test_a.py::test_one FAILED [ 50%]'
+  ]
+  for (const line of pytestProgressForms) {
+    check(
+      '终审3: 进度行形态 — ' + line,
+      failureSetOf(line).size === 0,
+      'items=' + [...failureSetOf(line)].join(',')
+    )
+  }
+  check(
+    '终审3: 真实 pytest 失败仍进集合（E 行 + 帧）',
+    failureSetOf('tests/test_a.py:12: in test_one\n    def test_one():\n>       assert False\nE       AssertionError: same').size === 1,
+    'size=' + failureSetOf('tests/test_a.py:12: in test_one\n    def test_one():\n>       assert False\nE       AssertionError: same').size
+  )
+  check(
+    '终审3: 含百分号的真实诊断仍进集合',
+    failureSetOf('tests/test_a.py:12: error: expected 100%').size === 1,
+    'size=' + failureSetOf('tests/test_a.py:12: error: expected 100%').size
+  )
+}
+// ── 28c. 终审合同（第九轮）：四套真实 runner 输出的身份基线
+//
+// 为什么要有这一组：此前所有 runner 断言都是「单行 / 两行」的形态断言，没有一份
+// **完整输出**。而 errorFingerprint 的塌陷（jest 两种完全不同的失败得到同一指纹）与
+// failureSetOf 的假条目（tsc 的 2 条真 error 被撑成 7 条）都只在完整输出里才暴露 ——
+// 单行夹具永远测不出来，因为噪声来自 runner 的「自由格式尾巴」，只有整段才有。
+//
+// 这一组钉三件事：目标是谁、身份可不可区分、集合里到底几条。
+//
+// 注意 pytestB 那条断言：数字归一（402 与 403 折成同一 errorFingerprint）是**设计取舍**
+// 不是缺陷 —— 集合身份由 failureItemFingerprint 承担，它保留消息里的数字。把它写成
+// 显式期望，是为了让后来者别把它当 bug「修掉」：真身份在集合里，不在整段指纹里。
+{
+  const jestA = [
+    'PASS test/a.test.js',
+    'FAIL test/pay.test.js',
+    '  ● pay rejects expired card',
+    '',
+    '    expect(received).toBe(expected)',
+    '',
+    '    Expected: 402',
+    '    Received: 200',
+    '',
+    'Test Suites: 1 failed, 1 passed, 2 total',
+    'Tests:       1 failed, 1 passed, 2 total',
+    'Ran all test suites.'
+  ].join('\n')
+  const jestB = [
+    'PASS test/a.test.js',
+    'FAIL test/pay.test.js',
+    '  ● pay rejects expired card',
+    '',
+    '    TypeError: Cannot read properties of undefined (reading amount)',
+    '',
+    '      at Object.<anonymous> (test/pay.test.js:12:9)',
+    '',
+    'Test Suites: 1 failed, 1 passed, 2 total',
+    'Tests:       1 failed, 1 passed, 2 total',
+    'Ran all test suites.'
+  ].join('\n')
+  const vitestA = [
+    ' RUN  v2.1.8 C:/work/proj',
+    '',
+    ' ❯ test/pay.test.js (3 tests | 1 failed) 12ms',
+    '   × pay rejects expired card 8ms',
+    '     → expected 200 to be 402',
+    '',
+    ' Test Files  1 failed (1)',
+    '      Tests  1 failed (3)',
+    '   Start at  12:04:31',
+    '   Duration  412ms'
+  ].join('\n')
+  const pytestA = [
+    '============================= test session starts =============================',
+    'platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.5.0',
+    'rootdir: C:/work/proj',
+    'plugins: cov-5.0.0',
+    'collected 2 items',
+    '',
+    'tests/test_pay.py ..F                                                    [100%]',
+    '',
+    '=================================== FAILURES ===================================',
+    '______________________________ test_expired ___________________________________',
+    '',
+    '    def test_expired():',
+    '>       assert charge() == 402',
+    'E       assert 200 == 402',
+    '',
+    'tests/test_pay.py:12: AssertionError',
+    '=========================== short test summary info ===========================',
+    'FAILED tests/test_pay.py::test_expired - assert 200 == 402',
+    '============================== 1 failed in 0.31s =============================='
+  ].join('\n')
+  const pytestB = pytestA.replace('test_expired', 'test_currency').replace('assert 200 == 402', 'assert 200 == 403')
+  const tscA = [
+    '> proj@1.0.0 typecheck',
+    '> tsc --noEmit',
+    '',
+    'src/a.ts(12,9): error TS2322: Type number is not assignable to type string.',
+    'src/b.ts(31,3): error TS2345: Argument of type string is not assignable to parameter of type number.',
+    '',
+    'Found 2 errors in 2 files.',
+    '',
+    'Errors  Files',
+    '     2  src/a.ts:12',
+    '     1  src/b.ts:31'
+  ].join('\n')
+
+  // ── jest：S1 的原始现场。失败行是 FAIL，断言块在下面；PASS 行必须先被排除，
+  //    否则目标会取到通过的那个文件 —— 那正是 0.3.5 之前的真实故障。
+  check(
+    'golden jest: 目标取 FAIL 的文件，不是 PASS 的文件',
+    samePath(errorTargetOf(jestA), 'test/pay.test.js'),
+    'target=' + JSON.stringify(errorTargetOf(jestA))
+  )
+  check(
+    'golden jest: 两种不同失败不得塌成同一指纹（S1 回归位）',
+    errorFingerprint(jestA) !== errorFingerprint(jestB),
+    errorFingerprint(jestA) + ' vs ' + errorFingerprint(jestB)
+  )
+  const jestSetA = failureSetOf(jestA)
+  const jestSetB = failureSetOf(jestB)
+  check(
+    'golden jest: 断言块（Expected/Received）本身不产生条目',
+    jestSetA.size === 1,
+    'size=' + jestSetA.size + ' items=' + [...jestSetA].join(',')
+  )
+  check(
+    'golden jest: 换成 TypeError 后集合严格变大（新失败是新身份）',
+    jestSetB.size === 2 && [...jestSetA].every((it) => jestSetB.has(it)),
+    'A=' + jestSetA.size + ' B=' + jestSetB.size
+  )
+  check(
+    'golden jest: 集合里每一条都指向失败文件',
+    [...jestSetA].every((it) => it.startsWith('test/pay.test.js|')),
+    [...jestSetA].join(',')
+  )
+  // ── 大小写：词表判的是**自然语言**，不是路径，折叠必须无条件成立。
+  //    修复前这一条用的是 foldCase（按平台折叠），于是 Linux 上 `FAIL` 匹配不到
+  //    词表里的 `fail`，回溯把它吃进 token，目标变成 `FAIL test/pay.test.js` ——
+  //    同一个文件在 Windows 与 Linux 上是两个身份，A/B 全线错位。
+  //    这条断言在任何平台都必须绿（linux 轮之前是红的，正是它抓到的）。
+  check(
+    '大小写: 全大写前缀词不得被吃进目标（平台无关）',
+    samePath(errorTargetOf('FAIL test/pay.test.js'), 'test/pay.test.js'),
+    'target=' + JSON.stringify(errorTargetOf('FAIL test/pay.test.js'))
+  )
+  check(
+    '大小写: ERROR 前缀同理（tsc / eslint 形态）',
+    samePath(errorTargetOf('ERROR in src/a.ts:12'), 'src/a.ts'),
+    'target=' + JSON.stringify(errorTargetOf('ERROR in src/a.ts:12'))
+  )
+
+  // ── vitest：` RUN  v2.1.8 <项目根>` 是版本头，不是失败目标。
+  //    修复前它抢到了整段目标 c:/work/proj，并把项目根当成一条失败。
+  check(
+    'golden vitest: RUN 版本头不得成为目标（不得取到项目根）',
+    samePath(errorTargetOf(vitestA), 'test/pay.test.js'),
+    'target=' + JSON.stringify(errorTargetOf(vitestA))
+  )
+  check(
+    'golden vitest: 整段只有一条失败，不因 Start at / Duration 增条目',
+    failureSetOf(vitestA).size === 1,
+    'items=' + [...failureSetOf(vitestA)].join(',')
+  )
+  // 0.3.6 口径变更：不再把数字归一成 <n>。
+  // 位置类数字（:line:col）已被 <path> 规则整段吃掉；剩下的数字是失败语义
+  // （expected 200 to be 402 / TS2322 / case-1），归一会把不同的失败抹成同一个。
+  // 于是「只换期望值」也必须换指纹 —— 这才是 B 判「同一个错」的可靠口径。
+  check(
+    'golden vitest: 断言里的数字变化必须改变整段指纹（0.3.6 口径）',
+    errorFingerprint(vitestA) !== errorFingerprint(vitestA.replace('402', '403')),
+    errorFingerprint(vitestA) + ' vs ' + errorFingerprint(vitestA.replace('402', '403'))
+  )
+
+  // ── pytest：会话头（platform / rootdir / plugins / collected）与进度行都不许进集合。
+  check(
+    'golden pytest: 目标取失败文件，不取 rootdir',
+    samePath(errorTargetOf(pytestA), 'tests/test_pay.py'),
+    'target=' + JSON.stringify(errorTargetOf(pytestA))
+  )
+  check(
+    'golden pytest: 集合里每一条都指向失败文件（会话头未造出 rootdir 条目）',
+    [...failureSetOf(pytestA)].every((it) => it.startsWith('tests/test_pay.py|')),
+    [...failureSetOf(pytestA)].join(',')
+  )
+  check(
+    'golden pytest: 换用例名 + 换断言数字 → 集合身份改变',
+    failureSetKey(failureSetOf(pytestA)) !== failureSetKey(failureSetOf(pytestB)),
+    failureSetKey(failureSetOf(pytestA)) + ' vs ' + failureSetKey(failureSetOf(pytestB))
+  )
+  // 同上：换用例名 + 换断言数字，整段指纹也必须变（0.3.6 口径）。
+  // 集合身份与整段指纹在这里终于同向 —— 之前是「集合分得开、指纹塌成一样」，
+  // 正是 B 误报与 F 漏报的共同根因。
+  check(
+    'golden pytest: 换用例名 + 换数字 → 整段指纹也变（0.3.6 口径）',
+    errorFingerprint(pytestA) !== errorFingerprint(pytestB),
+    errorFingerprint(pytestA) + ' vs ' + errorFingerprint(pytestB)
+  )
+
+  // ── tsc：汇总尾部（Found N errors / Errors Files / 计数表行）曾被算成失败条目，
+  //    于是「2 个错误」在集合里是 7 条，身份随错误计数漂移。
+  const tscSet = failureSetOf(tscA)
+  check(
+    'golden tsc: 目标取第一条 error 的文件',
+    samePath(errorTargetOf(tscA), 'src/a.ts'),
+    'target=' + JSON.stringify(errorTargetOf(tscA))
+  )
+  check(
+    'golden tsc: 两条真 error 恰好两条条目（汇总尾部与 npm banner 不进集合）',
+    tscSet.size === 2,
+    'size=' + tscSet.size + ' items=' + [...tscSet].join(',')
+  )
+  check(
+    'golden tsc: 没有任何条目带空目标（计数表行曾造出 |hash）',
+    [...tscSet].every((it) => !it.startsWith('|')),
+    [...tscSet].join(',')
+  )
+
+  // ── 噪声行逐条：这些行单独喂进去必须一条都不产出。
+  //    整段测试只能证明「这一段收敛了」，逐条才能定位是哪个形态漏了。
+  const noiseLines = [
+    '   Start at  12:04:31',
+    '   Duration  412ms',
+    ' Ran all test suites.',
+    '> proj@1.0.0 typecheck',
+    '> tsc --noEmit',
+    'Found 2 errors in 2 files.',
+    'Errors  Files',
+    '     2  src/a.ts:12',
+    ' RUN  v2.1.8 C:/work/proj',
+    'RUNS  test/a.test.js',
+    'tests/test_pay.py ..F                      [ 66%]',
+    '> npm run build'
+  ]
+  for (const line of noiseLines) {
+    check(
+      'golden 噪声行不产生条目 — ' + line.trim(),
+      failureSetOf(line).size === 0,
+      'items=' + [...failureSetOf(line)].join(',')
+    )
+  }
+}
+// ── 30A. createMeasureSettler：不经过 apply，直接喂状态对象（P1-8 抽工厂的验收）
+//
+// 抽工厂的全部意义在这里：194 行的测量状态机原先只能靠 runTurn 端到端驱动，
+// 想断言「失败面收缩时 repairChain 归零」得先造一整轮工具调用 + 事件顺序，
+// 一旦红了只知道「第几步不对」。现在给个裸状态对象就能断言，失败直接指到分支。
+const settlerState = (over = {}) => ({
+  streakEdits: new Map(),
+  blindWrites: 0,
+  measureArmed: false,
+  wroteWhileArmed: false,
+  lastMeasure: void 0,
+  fired: { A: 0, B: 0, C: 0, F: 0, P: 0, M: 0 },
+  measureSeries: new Map(),
+  writeSeq: 0,
+  failEpisodes: new Map(),
+  clock: 0,
+  failSeq: 0,
+  repairChain: 0,
+  lastFailSet: new Set(),
+  lastFailWriteSeq: 0,
+  seenFailTargets: new Set(),
+  futile: 0,
+  ...over
+})
+const settler = createMeasureSettler({ cfg: { decayEditsOnVerify: true } })
+const tscA = "src/a.ts(12,9): error TS2322: Type 'string' is not assignable to type 'number'."
+const tscB = "src/b.ts(3,1): error TS2304: Cannot find name 'foo'."
+
+// 30a：测量不带目录 → 全部路径的盲改计数清零（那次测试覆盖了整个工作区）。
+{
+  const s = settlerState({ streakEdits: new Map([['C:/work/src/a.js', 3]]), blindWrites: 4, measureArmed: true, wroteWhileArmed: true })
+  const cleared = settler(s, { tool: 'bash', args: {}, ok: true, exit: 0, atStep: 4, text: 'ok' })
+  check('settler 无目录：streakEdits 清空，返回清掉的条数', cleared === 1 && s.streakEdits.size === 0, 'cleared=' + cleared + ' size=' + s.streakEdits.size)
+  check('settler 无目录：上膛解除', s.measureArmed === false && s.wroteWhileArmed === false, 'armed=' + s.measureArmed + ' wrote=' + s.wroteWhileArmed)
+  check('settler 无目录：盲改计数清零', s.blindWrites === 0, 'blindWrites=' + s.blindWrites)
+  check('settler 记下 lastMeasure 并推进 clock', s.lastMeasure?.atStep === 4 && s.lastMeasure.ok === true && s.clock === 1, JSON.stringify(s.lastMeasure) + ' clock=' + s.clock)
+}
+
+// 30b：测量带目录 → 只清它管得到的路径（在 C:/other 跑测试不能替 src 洗白）。
+{
+  const s = settlerState({ streakEdits: new Map([['C:/work/src/a.js', 2], ['C:/other/b.js', 2]]) })
+  const cleared = settler(s, { tool: 'bash', args: { command: 'cd C:/work && npm test' }, ok: true, exit: 0, atStep: 5, text: 'ok' })
+  check('settler 按目录：只清 C:/work 下的路径', cleared === 1 && s.streakEdits.size === 1 && s.streakEdits.has('C:/other/b.js'), 'cleared=' + cleared + ' left=' + [...s.streakEdits.keys()].join(','))
+  check('settler 按目录：还剩没清的路径时不清空整张表', s.streakEdits.size === 1, 'left=' + s.streakEdits.size)
+}
+
+// 30c：decayEditsOnVerify=false 是完全关掉这条闸，不是「只关一半」。
+{
+  const off = createMeasureSettler({ cfg: { decayEditsOnVerify: false } })
+  const s = settlerState({ streakEdits: new Map([['C:/work/src/a.js', 3]]), measureArmed: true })
+  const cleared = off(s, { tool: 'bash', args: {}, ok: true, exit: 0, atStep: 6, text: 'ok' })
+  check('settler 开关关掉：一条都不清', cleared === 0 && s.streakEdits.size === 1 && s.measureArmed === true, 'cleared=' + cleared + ' size=' + s.streakEdits.size)
+}
+
+// 30d：ok 测量重新武装 A / C / F / P，并把 futile 清零；B 不在此重新武装。
+{
+  const s = settlerState({ fired: { A: 2, B: 1, C: 2, F: 1, P: 2, M: 0 }, futile: 3 })
+  settler(s, { tool: 'bash', args: {}, ok: true, exit: 0, atStep: 7, text: 'ok' })
+  check('settler ok：A/C/F/P 重新武装、B 保持', s.fired.A === 0 && s.fired.C === 0 && s.fired.F === 0 && s.fired.P === 0 && s.fired.B === 1, JSON.stringify(s.fired))
+  check('settler ok：futile 清零', s.futile === 0, 'futile=' + s.futile)
+}
+
+// 30e：失败测量无条件推进 failSeq —— 哪怕一条条目都解析不出来（P1-11 的直接断言）。
+{
+  const s = settlerState({ writeSeq: 1, lastFailWriteSeq: 0 })
+  settler(s, { tool: 'bash', args: { command: 'npm test' }, ok: false, exit: 1, atStep: 8, text: '[exit code: 1]' })
+  check('settler 失败但解析不出条目：failSeq 仍然 +1', s.failSeq === 1, 'failSeq=' + s.failSeq)
+  check('settler 失败但解析不出条目：不造 episode', s.failEpisodes.size === 0, 'episodes=' + s.failEpisodes.size)
+}
+
+// 30f：P 的三态 —— 严格变小归零、一字未变归零、变了没变小才 +1。
+{
+  const one = failureSetOf(tscA)
+  const two = new Set([...one, ...failureSetOf(tscB)])
+  const shrunk = settlerState({ writeSeq: 2, lastFailWriteSeq: 1, repairChain: 2, lastFailSet: two, seenFailTargets: failureTargetsOf(two) })
+  settler(shrunk, { tool: 'bash', args: { command: 'npx tsc --noEmit' }, ok: false, exit: 1, atStep: 9, text: tscA })
+  check('settler P：失败面严格变小 → repairChain 归零', shrunk.repairChain === 0, 'chain=' + shrunk.repairChain)
+  const same = settlerState({ writeSeq: 2, lastFailWriteSeq: 1, repairChain: 2, lastFailSet: one, seenFailTargets: failureTargetsOf(one) })
+  settler(same, { tool: 'bash', args: { command: 'npx tsc --noEmit' }, ok: false, exit: 1, atStep: 9, text: tscA })
+  check('settler P：一字未变 → 清零且不计数', same.repairChain === 0, 'chain=' + same.repairChain)
+  const grew = settlerState({ writeSeq: 2, lastFailWriteSeq: 1, repairChain: 0, lastFailSet: one, seenFailTargets: failureTargetsOf(one) })
+  settler(grew, { tool: 'bash', args: { command: 'npx tsc --noEmit' }, ok: false, exit: 1, atStep: 9, text: tscA + '\n' + tscB })
+  check('settler P：变了但没变小 → 补丁链 +1', grew.repairChain === 1, 'chain=' + grew.repairChain)
+  check('settler P：写入序号被记下，下一轮没有新写入就不再计', grew.lastFailWriteSeq === 2, 'lastFailWriteSeq=' + grew.lastFailWriteSeq)
+}
+
+// 30g：O 用条目交集判复发 —— 老失败里又添一条新的，仍算「同一个失败回来了」。
+{
+  const one = failureSetOf(tscA)
+  const key = measureKey('bash', { command: 'npx tsc --noEmit' })
+  const recurring = settlerState({ writeSeq: 3, measureSeries: new Map([[key, { lastOk: true, lastWriteSeq: 2, flips: 0, recentFailSets: [[...one]] }]]) })
+  settler(recurring, { tool: 'bash', args: { command: 'npx tsc --noEmit' }, ok: false, exit: 1, atStep: 10, text: tscA + '\n' + tscB })
+  check('settler O：整集合变了但与历史有交集 → flips +1', recurring.measureSeries.get(key)?.flips === 1, 'flips=' + recurring.measureSeries.get(key)?.flips)
+  const fresh = settlerState({ writeSeq: 3, measureSeries: new Map([[key, { lastOk: true, lastWriteSeq: 2, flips: 0, recentFailSets: [[...failureSetOf(tscB)]] }]]) })
+  settler(fresh, { tool: 'bash', args: { command: 'npx tsc --noEmit' }, ok: false, exit: 1, atStep: 10, text: tscA })
+  check('settler O：零交集（健康 TDD 的新红）→ 不计翻转', fresh.measureSeries.get(key)?.flips === 0, 'flips=' + fresh.measureSeries.get(key)?.flips)
+}
+// ── 30h：部分清除也解除武装（C 误报的直接根因）
+//
+// 旧逻辑要求 streakEdits 被清空才算「测过了」。带 workdir 的测量只清它管得到的目录，
+// 剩下一条没清就保留 measureArmed + wroteWhileArmed —— 同一个 turn 里于是反复上膛
+// 反复开口（实测同一 turn 最多响 3 次，全库 C 占注入的 71%）。
+{
+  const s = settlerState({
+    streakEdits: new Map([['C:/work/src/a.js', 2], ['C:/other/b.js', 2]]),
+    blindWrites: 4,
+    measureArmed: true,
+    wroteWhileArmed: true
+  })
+  const cleared = settler(s, { tool: 'bash', args: { command: 'cd C:/work && npm test' }, ok: true, exit: 0, atStep: 5, text: 'ok' })
+  check('settler 部分清除：cleared===1 但武装照样解除', cleared === 1 && s.measureArmed === false, 'cleared=' + cleared + ' armed=' + s.measureArmed)
+  check('settler 部分清除：wroteWhileArmed 解除且盲改计数清零', s.wroteWhileArmed === false && s.blindWrites === 0, 'wrote=' + s.wroteWhileArmed + ' blind=' + s.blindWrites)
+  check('settler 部分清除：管不到的路径仍然留着', s.streakEdits.has('C:/other/b.js') && s.streakEdits.size === 1, 'left=' + [...s.streakEdits.keys()].join(','))
+}
+
+// ── 30i：失败的测量不重新武装 C（没带来新事实，现场还在）
+{
+  const s = settlerState({ fired: { A: 1, B: 0, C: 1, F: 0, P: 0, M: 0 } })
+  settler(s, { tool: 'bash', args: { command: 'npm test' }, ok: false, exit: 1, atStep: 6, text: '[exit code: 1]' })
+  check('settler 失败测量：fired.C 保持 1（不重新武装）', s.fired.C === 1, 'C=' + s.fired.C)
+  check('settler 失败测量：fired.A 仍归 0（A 只认新事实，与 C 不同轴）', s.fired.A === 0, 'A=' + s.fired.A)
+}
+
+// ── 30j：Git Bash 的 /c/… 方言必须与写入侧的 C:/… 对上（0.3.6 实测 bug）
+//
+// 真实日志 266 条 measure 里 238 条 cleared=0（89.5%）：本机 bash 工具是 MSYS Git Bash，
+// `cd /c/Users/… && npm test` 给出的候选是 `/c/users/…`，写入侧记的是 `C:/Users/…`，
+// 两边永不相交 ⇒ 上膛状态永不解除 ⇒ C 在同一个现场反复开口（占注入 72.5%、命中率 8.3%）。
+{
+  // 两侧统一写小写：这条断言只测「方言归一」，大小写折叠是 foldCase 的事，
+  // 而 test:posix / test:linux 变体把 CASE_INSENSITIVE 关掉了，混在一起会红。
+  const s = settlerState({
+    streakEdits: new Map([['c:/users/x/src/a.js', 3]]),
+    blindWrites: 4,
+    measureArmed: true,
+    wroteWhileArmed: true
+  })
+  const cleared = settler(s, { tool: 'bash', args: { command: 'cd /c/users/x && npm test' }, ok: true, exit: 0, atStep: 6, text: 'ok' })
+  check('settler MSYS 方言：/c/… 与 c:/… 视为同一目录', cleared === 1 && s.streakEdits.size === 0, 'cleared=' + cleared + ' size=' + s.streakEdits.size)
+  check('settler MSYS 方言：上膛解除、盲改清零', s.measureArmed === false && s.blindWrites === 0, 'armed=' + s.measureArmed + ' blind=' + s.blindWrites)
+  const wrong = settlerState({ streakEdits: new Map([['c:/users/x/src/a.js', 3]]) })
+  const other = settler(wrong, { tool: 'bash', args: { command: 'cd /c/users/y && npm test' }, ok: true, exit: 0, atStep: 6, text: 'ok' })
+  check('settler MSYS 方言：别的目录仍然不清（不是把 /c/ 一律当 C 盘根）', other === 0 && wrong.streakEdits.size === 1, 'cleared=' + other)
+
+  // WSL 方言：同一条命令经 `wsl.exe -e bash -c` 跑出来，候选是 /mnt/c/users/x。
+  const wslState = settlerState({
+    streakEdits: new Map([['c:/users/x/src/a.js', 3]]),
+    blindWrites: 4,
+    measureArmed: true,
+    wroteWhileArmed: true
+  })
+  const wslCleared = settler(wslState, { tool: 'bash', args: { command: 'cd /mnt/c/users/x && npm test' }, ok: true, exit: 0, atStep: 6, text: 'ok' })
+  check('settler WSL 方言：/mnt/c/… 与 c:/… 视为同一目录', wslCleared === 1 && wslState.measureArmed === false, 'cleared=' + wslCleared + ' armed=' + wslState.measureArmed)
+  const wslOther = settlerState({ streakEdits: new Map([['c:/users/x/src/a.js', 3]]) })
+  const wslMiss = settler(wslOther, { tool: 'bash', args: { command: 'cd /mnt/data/x && npm test' }, ok: true, exit: 0, atStep: 6, text: 'ok' })
+  check('settler WSL 方言：/mnt/data 不是盘符挂载点，不清', wslMiss === 0 && wslOther.streakEdits.size === 1, 'cleared=' + wslMiss)
+}
+
+// ── 31. createDeliverer：不经过 apply，直接断言日志形状与消息形状（P1-8）
+//
+// 抽工厂的收益就在这里：deliver 过去只能在跑完一整轮、等到某个信号真的开口之后才被间接覆盖，
+// 日志字段少一个 / 顺序变了 / sample 忘了截断，都没有断言会红。现在直接喂状态对象。
+{
+  const delivererState = (over = {}) => ({
+    pendings: [],
+    lastAction: 'bash',
+    edits: new Map(),
+    streakEdits: new Map(),
+    errors: new Map(),
+    searchedThisTurn: false,
+    lastMeasure: void 0,
+    ...over
+  })
+  const makeDeliverer = () => {
+    const records = []
+    const infos = []
+    const ctx = { logger: { info: (line) => infos.push(line) } }
+    const deliver = createDeliverer({ ctx, record: async (line) => { records.push(line) } })
+    return { deliver, records, infos }
+  }
+  const decision = () => ({ kind: 'inject', messages: [{ role: 'system', content: [] }], reason: 'A' })
+  const session = { id: 'sess-1' }
+
+  // 31a. 埋点形状：pendings 是「这次注入之后发生了什么」的唯一来源，字段缺一个就永远收不到结果
+  {
+    const { deliver } = makeDeliverer()
+    const s = delivererState()
+    await deliver(session, { turn: 3, step: '7', decision: decision(), s, text: 'hi', tag: 'A', inj: 2, extra: '' })
+    const p = s.pendings[0]
+    check(
+      'deliverer 埋点：atStep 转成数字、before 取注入前的最后动作',
+      s.pendings.length === 1 && p.inj === 2 && p.tag === 'A' && p.turn === 3 && p.atStep === 7 && p.before === 'bash',
+      JSON.stringify(p)
+    )
+    check(
+      'deliverer 埋点：firstSeen / first / changed 都是初始态',
+      p.firstSeen === false && p.first === void 0 && p.changed === false,
+      JSON.stringify(p)
+    )
+  }
+
+  // 31b. 日志行：面板按 inj= 关联、按 chars/tokens 统计，字段名是外部契约
+  {
+    const { deliver, records, infos } = makeDeliverer()
+    const s = delivererState()
+    await deliver(session, { turn: 3, step: 7, decision: decision(), s, text: 'hello', tag: 'A', inj: 2, extra: '' })
+    const line = records[0]
+    check('deliverer 日志：inject 前缀与 session/turn/step/signals/inj 都在', /^inject session=sess-1 turn=3 step=7 signals=A inj=2 /.test(line), line)
+    check('deliverer 日志：chars 与 tokens 按实际文本算', line.includes('chars=5 ') && / tokens=\d+ /.test(line), line)
+    check('deliverer 日志：没测量过写 measured=no', line.includes('measured=no'), line)
+    check('deliverer 日志：logger.info 也收到一条，且带注入序号', infos.length === 1 && infos[0].includes('inject session=sess-1 turn=3 step=7 signals=A'), infos.join(' | '))
+  }
+
+  // 31c. measured=yes 的两种结局必须可区分：ok 与 fail 都是「测过了」，但结论相反
+  {
+    const okRun = makeDeliverer()
+    await okRun.deliver(session, { turn: 1, step: 1, decision: decision(), s: delivererState({ lastMeasure: { tool: 'bash', ok: true } }), text: 'x', tag: 'C', inj: 1, extra: '' })
+    const failRun = makeDeliverer()
+    await failRun.deliver(session, { turn: 1, step: 1, decision: decision(), s: delivererState({ lastMeasure: { tool: 'bash', ok: false } }), text: 'x', tag: 'C', inj: 1, extra: '' })
+    check('deliverer 日志：测过且通过写 yes:bash:ok', okRun.records[0].includes('measured=yes:bash:ok'), okRun.records[0])
+    check('deliverer 日志：测过但失败写 yes:bash:fail', failRun.records[0].includes('measured=yes:bash:fail'), failRun.records[0])
+  }
+
+  // 31d. 三个 worst 数：面板的 intensity 全靠它们，取错（比如取最后一次而不是最大值）不会报错只会静默偏小
+  {
+    const { deliver, records } = makeDeliverer()
+    const s = delivererState({
+      edits: new Map([['a.js', 2], ['b.js', 5]]),
+      streakEdits: new Map([['a.js', 4]]),
+      errors: new Map([
+        ['e1', { count: 1, sample: 'ENOENT a' }],
+        ['e2', { count: 3, sample: 'ENOENT b' }]
+      ]),
+      searchedThisTurn: true
+    })
+    await deliver(session, { turn: 2, step: 2, decision: decision(), s, text: 'x', tag: 'B', inj: 1, extra: '' })
+    const line = records[0]
+    check('deliverer 日志：worstEdits 取最大值不是末值', line.includes('files=2 worstEdits=5 '), line)
+    check('deliverer 日志：worstStreak 单独写出（A 的判据）', line.includes('worstStreak=4 '), line)
+    check('deliverer 日志：worstErrors 与 sample 取自同一条（计数最大的那条）', line.includes('worstErrors=3 ') && line.includes('sample="ENOENT b"'), line)
+    check('deliverer 日志：searched 反映本 turn 是否搜过', line.includes('searched=true '), line)
+  }
+
+  // 31e. sample 必须截断：报错原文可能上千字符，日志一行爆掉会让面板整行解析失败
+  {
+    const { deliver, records } = makeDeliverer()
+    const long = 'E'.repeat(300)
+    const s = delivererState({ errors: new Map([['k', { count: 1, sample: long }]]) })
+    await deliver(session, { turn: 1, step: 1, decision: decision(), s, text: 'x', tag: 'B', inj: 1, extra: '' })
+    const line = records[0]
+    const m = line.match(/sample=(".*?")$/)
+    check('deliverer 日志：sample 截到 80 字符并保留 JSON 引号', m !== null && JSON.parse(m[1]).length === 80, line.slice(-40))
+  }
+
+  // 31f. extra 是 M / done 这类附加字段的通道；空 extra 不能留下尾空格（面板按空格切分）
+  {
+    const withExtra = makeDeliverer()
+    await withExtra.deliver(session, { turn: 1, step: 1, decision: decision(), s: delivererState(), text: 'x', tag: 'M', inj: 1, extra: 'futile=2' })
+    const plain = makeDeliverer()
+    await plain.deliver(session, { turn: 1, step: 1, decision: decision(), s: delivererState(), text: 'x', tag: 'A', inj: 1, extra: '' })
+    check('deliverer 日志：extra 拼在 measured 之后', /measured=no futile=2$/.test(withExtra.records[0]), withExtra.records[0])
+    check('deliverer 日志：空 extra 不留尾空格', plain.records[0] === plain.records[0].trimEnd(), JSON.stringify(plain.records[0].slice(-12)))
+  }
+
+  // 31g. 消息形状：decision 其余字段原样透传，追加的是一条带 source.kind 的 user 消息
+  {
+    const { deliver } = makeDeliverer()
+    const d = decision()
+    const out = await deliver(session, { turn: 1, step: 1, decision: d, s: delivererState(), text: '观察：同一文件改了 3 次', tag: 'A', inj: 1, extra: '' })
+    const added = out.messages[out.messages.length - 1]
+    check('deliverer 消息：decision 的 kind / reason 原样透传', out.kind === 'inject' && out.reason === 'A', out.kind + '/' + out.reason)
+    check('deliverer 消息：原有消息保留在前面', out.messages.length === 2 && out.messages[0] === d.messages[0], 'len=' + out.messages.length)
+    check('deliverer 消息：追加的是 user 文本消息且自报 kind', added.role === 'user' && added.content[0].type === 'text' && added.content[0].text === '观察：同一文件改了 3 次' && added.source.kind === 'dsh-better-debug', JSON.stringify(added))
+    check('deliverer 消息：每条都有独立 id（UI 去重靠它）', typeof added.id === 'string' && added.id.length >= 8, String(added.id))
+    check('deliverer 消息：不改动传入的 decision 对象', d.messages.length === 1, 'len=' + d.messages.length)
+  }
+
+  // 31h. logger 抛错不能把注入本身带下去：日志是观测面，不是投递路径的一部分
+  {
+    const records = []
+    const ctx = { logger: { info: () => { throw new Error('logger boom') } } }
+    const deliver = createDeliverer({ ctx, record: async (line) => { records.push(line) } })
+    const s = delivererState()
+    let threw = false
+    let out
+    try {
+      out = await deliver(session, { turn: 1, step: 1, decision: decision(), s, text: 'x', tag: 'A', inj: 1, extra: '' })
+    } catch { threw = true }
+    check('deliverer logger 抛错：不冒泡，注入照常返回', threw === false && out?.messages.length === 2, 'threw=' + threw)
+    check('deliverer logger 抛错：文件日志仍然写了', records.length === 1 && records[0].startsWith('inject '), 'records=' + records.length)
+  }
+}
+// ── 58. 配置：doneOnPresent:false 关掉 present 之后的休眠
+//
+// 默认 true：present 成功视为交付，之后的 pre-step 直接 return（只记一次 suppress）。
+// 这个键此前只有真分支被测过 —— 关掉它到底会不会照常开口，没人验证。
+{
+  const run = async (extra) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    const steps = [
+      [(s, c) => edit('/work/src/a.js')(s, c)],
+      [(s, c) => edit('/work/src/a.js')(s, c)],
+      [(s, c) => edit('/work/src/a.js')(s, c)],
+      [(s, c, st) => fail('d1', 'TypeError: boom')(s, c, st)], // pre-step 4 落 A
+      [(s, c, st) => tool('d2', 'present', { text: 'presented' })(s, c, st)], // 交付态
+      [(s, c, st) => fail('d3', 'RangeError: other')(s, c, st)],
+      [(s, c, st) => fail('d4', 'RangeError: other')(s, c, st)],
+      []
+    ]
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const on = await run({})
+  const off = await run({ doneOnPresent: false })
+  check(
+    'doneOnPresent 默认 true：present 之后不再开口',
+    has(on, '同一个操作重复报错') === void 0,
+    'signals=' + injections(on)
+  )
+  check(
+    'doneOnPresent:false → present 之后 B 照常开口',
+    has(off, '同一个操作重复报错') !== void 0,
+    'signals=' + injections(off)
+  )
+}
+
+// ── 59. 配置：repeatFamilyThreshold 参与 F 的判据（默认 4）
+//
+// F 要同时过两道闸：族内不同指纹数 >= familyMinFingerprints、族内总次数 >= repeatFamilyThreshold。
+// 用 5 个互不相同的指纹（每个只出现一次）把 B 摘掉，剩下的注入只可能来自 F。
+{
+  const at = (msg) => msg + '\n    at parse (file:///C:/work/src/a.mjs:12:29)'
+  const msgs = ['TypeError: alpha', 'RangeError: beta', 'SyntaxError: gamma', 'EvalError: delta', 'URIError: epsilon']
+  const run = async (extra) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    // 每步换一个文件：避免 streakEdits 攒够 3 次把 A 引进来。
+    const steps = msgs.map((m, i) => [
+      [(s, c) => edit('/work/src/f' + i + '.js')(s, c)],
+      [(s, c, st) => fail('f' + i, at(m))(s, c, st)]
+    ].flat())
+    steps.push([])
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const base = await run({})
+  const high = await run({ repeatFamilyThreshold: 6 })
+  check('F: 默认阈值 4，5 次不同指纹触发', has(base, '种不同报错') !== void 0, 'signals=' + injections(base))
+  check(
+    'repeatFamilyThreshold:6 → 同样 5 次不够阈值，不报 F',
+    has(high, '种不同报错') === void 0,
+    'signals=' + injections(high)
+  )
+}
+
+// ── 60. 配置：familyMinFingerprints 参与 F 的判据（默认 3）
+{
+  const at = (msg) => msg + '\n    at parse (file:///C:/work/src/a.mjs:12:29)'
+  const msgs = ['TypeError: alpha', 'RangeError: beta', 'SyntaxError: gamma', 'EvalError: delta', 'URIError: epsilon']
+  const run = async (extra) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    const steps = msgs.map((m, i) => [
+      [(s, c) => edit('/work/src/g' + i + '.js')(s, c)],
+      [(s, c, st) => fail('h' + i, at(m))(s, c, st)]
+    ].flat())
+    steps.push([])
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const base = await run({})
+  const strict = await run({ familyMinFingerprints: 6 })
+  check('F: 默认 3 种指纹即够', has(base, '种不同报错') !== void 0, 'signals=' + injections(base))
+  check(
+    'familyMinFingerprints:6 → 5 种指纹不够，不报 F（总次数已过 repeatFamilyThreshold）',
+    has(strict, '种不同报错') === void 0,
+    'signals=' + injections(strict)
+  )
+}
+
+// ── 61. 配置：oscillationThreshold 参与 O 的判据（默认 3）
+//
+// 同一段断言文本绿→红→绿→红，每次翻转之间都有修改，实测 flips=3。
+// 阈值抬到 5 之后同样的剧本必须一声不响 —— 否则这个键就是死配置。
+{
+  const red = 'AssertionError: expected 3 to be 4\n    at C:/work/test/a.test.mjs:12:29\n[exit code: 1]'
+  const run = async (extra) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    const file = '/work/src/a.js'
+    const steps = [
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('o1', red)(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => measure('o2')(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('o3', red)(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => measure('o4')(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('o5', red)(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => measure('o6')(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('o7', red)(s, c)],
+      []
+    ]
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const base = await run({})
+  const high = await run({ oscillationThreshold: 5 })
+  check('O: 默认阈值 3，三次翻转触发', has(base, '翻转了') !== void 0, 'signals=' + injections(base))
+  check('oscillationThreshold:5 → 三次翻转不够，不报 O', has(high, '翻转了') === void 0, 'signals=' + injections(high))
+}
+
+// ── 62. 配置：patchChainThreshold 参与 P 的判据（默认 3）
+//
+// 三轮「验证失败 → 修改 → 验证仍失败」，每轮换一个新失败 → repairChain=3。
+// 阈值抬到 4 之后必须不响。
+{
+  const red = (n) => 'AssertionError: case-' + n + ' failed\n    at C:/work/test/a.test.mjs:4:9\n[exit code: 1]'
+  const run = async (extra) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    const file = '/work/src/a.js'
+    const steps = [
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('p1', red('one'))(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('p2', red('two'))(s, c)],
+      [(s, c) => edit(file)(s, c), (s, c) => runFail('p3', red('three'))(s, c)],
+      []
+    ]
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const base = await run({})
+  const high = await run({ patchChainThreshold: 4 })
+  check('P: 默认阈值 3，三轮补丁链触发', has(base, '轮「验证失败') !== void 0, 'signals=' + injections(base))
+  check('patchChainThreshold:4 → 三轮不够，不报 P', has(high, '轮「验证失败') === void 0, 'signals=' + injections(high))
+}
+
+// ── 63. 配置：metaAfterFutile 参与 M 的判据（默认 2）
+//
+// 剧本同组 33：两条注入各自在窗口内没等到转向 → futile=2。
+// 阈值抬到 3 之后必须不落 M（其余 A/B 照旧）。
+{
+  const run = async (extra) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    const file = '/work/src/a.js'
+    const stack = 'TypeError: boom\n    at C:/work/src/a.mjs:7:2'
+    const steps = [
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c, st) => fail('m1', stack, 'ops_write')(s, c, st)],
+      [(s, c, st) => fail('m2', stack, 'ops_write')(s, c, st)],
+      [(s, c, st) => shell('m3')(s, c, st)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c, st) => shell('m4')(s, c, st)], // 12 > 4+6 → 第一条作废
+      [(s, c, st) => shell('m5')(s, c, st)], // 13 > 6+6 → 第二条作废，futile=2
+      []
+    ]
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const base = await run({})
+  const high = await run({ metaAfterFutile: 3 })
+  check('M: 默认阈值 2，两条无效注入后落元闸门', has(base, '元观察') !== void 0, 'signals=' + injections(base))
+  check('metaAfterFutile:3 → futile=2 不够，不落 M', has(high, '元观察') === void 0, 'signals=' + injections(high))
+}
+
+// ── 64. 配置：excludePaths 命中即完全不计入盲改
+//
+// 判据在 fs/write-intent 里、计数之前：命中的路径连 edits / streakEdits / writeSeq 都不动。
+// 默认值只排除 node_modules / 锁文件 / *.log 之类；这里换成一个自定义生成目录。
+{
+  const run = async (extra, target) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession() }
+    const steps = [
+      [(s, c) => edit(target)(s, c)],
+      [(s, c) => edit(target)(s, c)],
+      [(s, c) => edit(target)(s, c)],
+      []
+    ]
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const gen = '/work/gen/a.js'
+  const def = await run({}, gen)
+  const custom = await run({ excludePaths: '(^|/)gen/' }, gen)
+  const other = await run({ excludePaths: '(^|/)gen/' }, '/work/src/a.js')
+  check('excludePaths: 默认值不排除 /work/gen/，三次改仍落 A', has(def, '同一个文件累计改了') !== void 0, 'signals=' + injections(def))
+  check('excludePaths 自定义命中 → 三次改完全不计入', custom.length === 0, 'signals=' + injections(custom))
+  check('excludePaths 自定义未命中 → 照常落 A', has(other, '同一个文件累计改了') !== void 0, 'signals=' + injections(other))
+}
+// ── 65. 指纹换轴：换用例名不再被当成「同一个错重复」
+//
+// 0.3.6 之前 errorFingerprint 把数字一律归一成 <n>，健康 TDD 每轮换用例名
+// （case-one / case-two / case-three）也会塌成同一个指纹 → B 抢答、P 一次不响。
+// 现在数字保留：新用例 = 新失败 = 这一串补丁在制造下一个失败，B 让位给 P。
+{
+  const red = (n) => 'AssertionError: case-' + n + ' failed\n    at C:/work/test/a.test.mjs:4:9\n[exit code: 1]'
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const names = ['one', 'two', 'three', 'four', 'five']
+  const steps = []
+  for (const name of names) {
+    steps.push([(s, c) => edit(file)(s, c), (s, c) => runFail('q-' + name, red(name))(s, c)])
+  }
+  steps.push([])
+  const base = await runTurn(ctx, agent, { turn: 1, steps })
+  check('换用例名：B 不再抢答（补丁链让位给 P）', has(base, '同一个操作重复报错') === void 0, 'signals=' + injections(base))
+  check('换用例名：P 在补丁链上开口', has(base, '轮「验证失败') !== void 0, 'signals=' + injections(base))
+}
+
+// ── 66. 指纹反例：只漂行号仍然合并
+//
+// 行号已经被 <path> 规则整段吃掉，所以同一个失败换个行号仍是同一条 episode。
+// 这条是 65 的反例守卫：别把「位置类数字」也一起保留下来。
+//
+// 为什么第三轮才断言：第一次失败测量就把 repairChain 推到 1，B 的 failEpisodes
+// 层这时让位给 P；第二轮测量发现失败集合一字未变（unchanged）→ repairChain 归零，
+// 于是第三轮的 pre-step 才轮到 B 开口，n=2 正好证明前两次合并成了一条。
+{
+  const at = (line) => 'AssertionError: boom\n    at C:/work/test/a.test.mjs:' + line + ':9\n[exit code: 1]'
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('r1', at(4))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('r2', at(9))(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('r3', at(4))(s, c)],
+    []
+  ]
+  const base = await runTurn(ctx, agent, { turn: 1, steps })
+  check('只漂行号：前两次仍合成一条 episode（n=2）', has(base, '同一个操作重复报错 2 次') !== void 0, 'signals=' + injections(base))
+}
+
+// ── 67. PTC 根调用里的测量
+//
+// 根 run_code 的参数是 { code }，没有 command / script_path —— 0.3.5 之前一律
+// 判成非测量，于是 PTC 里跑 npm test 也不算测过，C 永远解不开上膛。
+// 这里让**子调用**故意是非测量（ls -la），唯一的测量来源就是根 code 文本。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c) => edit(file)(s, c)],
+    [(s, c, st) => ptc('rc1', 'ops_bash', 'sc1', {
+      code: 'await tools.bash({command:"npm test"})',
+      args: { command: 'ls -la', description: '看看目录' },
+      text: 'ok'
+    })(s, c, st)],
+    []
+  ]
+  const base = await runTurn(ctx, agent, { turn: 1, steps })
+  check('PTC：run_code 里的 npm test 算测量，C 不上膛', has(base, '自上次测量以来') === void 0, 'signals=' + injections(base))
+}
+
+// ── 68. PTC 根调用里的写入
+//
+// 写文件走 fs/write-intent，PTC 里 tools.write 不经过那条通道 —— 0.3.5 之前
+// 连写十几个文件也零注入。这里只做粗粒度识别（code 里出现 .write( / writeFile
+// / appendFile / fs.write 就记一次盲改）：宁可偶尔多算，也不能整条通道失明。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const code = 'await tools.write({path:"C:/work/src/a.js", content:"x"})'
+  const steps = []
+  for (let i = 1; i <= 6; i += 1) {
+    steps.push([(s, c, st) => ptc('rw' + i, 'ops_read_files', 'sw' + i, { code, args: { path: 'C:/work/src/a.js' }, text: 'ok' })(s, c, st)])
+  }
+  steps.push([])
+  const base = await runTurn(ctx, agent, { turn: 1, steps })
+  check('PTC：run_code 里的 write 计入盲改，C 开口', has(base, '自上次测量以来') !== void 0, 'signals=' + injections(base))
+}
+
+// ── 69. 读文件算转向：不再计入「无效注入」
+//
+// M 的文案是「写完之前不要发起任何修改类工具调用」，而读文件是在收集信息，
+// 不是带病继续改。把它算成「没转向」会让 M 在正常的读—改循环里误报。
+// 对照组用 ops_write（编辑类、非读）证明这条判据真的在起作用。
+{
+  // 剧本同组 63：A 在第 4 步上膛开口、B 在第 6 步开口，两条 pending 分别在
+  // 第 12 / 13 步过期，futile 攒到 2 —— 只有「读文件算不算转向」这一个变量不同。
+  const run = async (actionName) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession() }
+    const file = '/work/src/a.js'
+    const stack = 'TypeError: boom\n    at C:/work/src/a.mjs:7:2'
+    const act = (id) => [(s, c, st) => fail(id, stack, actionName)(s, c, st)]
+    const steps = [
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      act('k1'),
+      act('k2'),
+      [(s, c, st) => shell('k3')(s, c, st)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c) => edit(file)(s, c)],
+      [(s, c, st) => shell('k4')(s, c, st)], // 12 > 4+6 → 第一条作废
+      [(s, c, st) => shell('k5')(s, c, st)], // 13 > 6+6 → 第二条作废，futile=2
+      []
+    ]
+    return await runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const reads = await run('ops_read_files')
+  const writes = await run('ops_write')
+  check('读文件算转向 → 无效计数不涨，不落 M', has(reads, '元观察') === void 0, 'signals=' + injections(reads))
+  check('对照组：ops_write 不算转向 → 落 M', has(writes, '元观察') !== void 0, 'signals=' + injections(writes))
+}
+
+// ── 70. fired 表不再漏键（O 的 NaN 定时炸弹）
+//
+// s.fired['O'] += 1 在缺键时得到 NaN，而 NaN < 1 恒为 false —— O 会永久失声且
+// 不报错。state 不导出，NaN 只能靠观察状态发现，所以这里用两条源码形状断言
+// 钉住「表里有 O 键」与「累加兜住动态键」，再用组 61 的剧本跑一次真实 O 正例，
+// 确认改造之后 O 仍然照常开口。
+{
+  const src = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  check('fired 表含 O 键', /fired:\s*\{[^}]*\bO:\s*0\b/.test(src), 'lib/index.js')
+  check('fired 累加兜住动态键', src.includes('(s.fired[signal.kind] ?? 0) + 1'), 'lib/index.js')
+  const red = 'AssertionError: expected 3 to be 4\n    at C:/work/test/a.test.mjs:12:29\n[exit code: 1]'
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const file = '/work/src/a.js'
+  const steps = [
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('z1', red)(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('z2')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('z3', red)(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('z4')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('z5', red)(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => measure('z6')(s, c)],
+    [(s, c) => edit(file)(s, c), (s, c) => runFail('z7', red)(s, c)],
+    []
+  ]
+  const base = await runTurn(ctx, agent, { turn: 1, steps })
+  check('O 正例照常开口（fired.O 参与累加不崩）', has(base, '翻转了') !== void 0, 'signals=' + injections(base))
+}
+
+// ── 纯函数：指纹口径与 PTC 测量（最便宜的三条，失败时先看这里）
+{
+  const cfgLike = { measureCommands: /(npm|pnpm)\s+(run\s+)?(test|verify)/i, measureIntent: /验证|测试/i }
+  const caseA = 'AssertionError: case-1 failed\n    at C:/work/test/a.test.mjs:1:9'
+  const caseB = 'AssertionError: case-2 failed\n    at C:/work/test/a.test.mjs:2:9'
+  const locA = 'TypeError: x\n    at C:/work/src/a.js:10:5'
+  const locB = 'TypeError: x\n    at C:/work/src/a.js:11:5'
+  check('指纹：换用例名要分开', errorFingerprint(caseA) !== errorFingerprint(caseB), errorFingerprint(caseA))
+  check('指纹：只漂行号要合并', errorFingerprint(locA) === errorFingerprint(locB), errorFingerprint(locA))
+  check('run_code 里的 npm test 算测量', isMeasurement('run_code', { code: 'await tools.bash({command:"npm test"})' }, cfgLike) === true, 'run_code')
+}
 // ── 29. 导出形状
 check('导出 name', name === 'dsh-better-debug', name)
 const failed = results.filter((r) => !r.pass)

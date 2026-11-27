@@ -1,0 +1,62 @@
+2026-11-27T02:10:42.400Z apply pid=41208 logFile=C:/Users/yg/.dsh/logs/better-debug.log A=3 B=2 C=3 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1
+2026-11-27T02:11:19.400Z bundled skill registered: stuck-gate <- C:/Users/yg/.dsh/profiles/desktop/node_modules/dsh-better-debug/assets/stuck-gate/SKILL.md
+2026-11-27T02:12:00.900Z inject session=session-0001 turn=3 step=11 signals=A inj=a1b2c3d4 chars=298 tokens=241 blind=4 files=1 worstEdits=4 worstStreak=4 worstErrors=0 searched=false measured=no
+2026-11-27T02:12:39.700Z arm session=session-0001 turn=3 step=11 writes=3
+2026-11-27T02:13:17.600Z outcome session=session-0001 turn=3 inj=a1b2c3d4 after=A first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:13:57.300Z measure session=session-0001 turn=3 tool=ops_bash ok=true exit=0 cleared=3
+2026-11-27T02:14:39.700Z change session=session-0001 turn=3 inj=a1b2c3d4 after=A tool=ops_bash class=verify steps=2
+2026-11-27T02:15:16.700Z arm session=session-0002 turn=1 step=8 writes=4
+2026-11-27T02:15:58.200Z inject session=session-0002 turn=1 step=9 signals=C inj=b2c3d4e5 chars=302 tokens=248 blind=5 files=3 worstEdits=2 worstStreak=1 worstErrors=0 searched=false measured=no
+2026-11-27T02:16:37.000Z outcome session=session-0002 turn=1 inj=b2c3d4e5 after=C first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:17:14.900Z change session=session-0002 turn=1 inj=b2c3d4e5 after=C tool=ops_bash class=verify steps=1
+2026-11-27T02:17:54.600Z measure session=session-0002 turn=1 tool=ops_bash ok=false exit=1 cleared=0
+2026-11-27T02:18:37.000Z inject session=session-0003 turn=5 step=22 signals=B inj=c3d4e5f6 chars=353 tokens=262 files=0 worstEdits=0 worstStreak=0 worstErrors=2 searched=false measured=no sample="Error: ENOENT: no such file or directory, open 'C:/work/proj/conf/app.json'"
+2026-11-27T02:19:14.000Z outcome session=session-0003 turn=5 inj=c3d4e5f6 after=B first=ops_bash class=shell steps=1 before=bash
+2026-11-27T02:19:55.500Z futile session=session-0003 turn=5 inj=c3d4e5f6 after=B count=1 window=6
+2026-11-27T02:20:34.300Z arm session=session-0004 turn=2 step=6 writes=3
+2026-11-27T02:21:12.200Z inject session=session-0004 turn=2 step=7 signals=C inj=d4e5f6a7 chars=295 tokens=239 blind=4 files=2 worstEdits=2 worstStreak=1 worstErrors=0 searched=false measured=no
+2026-11-27T02:21:51.900Z outcome session=session-0004 turn=2 inj=d4e5f6a7 after=C first=edit class=edit steps=1 before=edit
+2026-11-27T02:22:34.300Z change session=session-0004 turn=2 inj=d4e5f6a7 after=C tool=ops_bash class=verify steps=2
+2026-11-27T02:23:11.300Z measure session=session-0004 turn=2 tool=ops_bash ok=true exit=0 cleared=2
+2026-11-27T02:23:52.800Z arm session=session-0005 turn=7 step=31 writes=5
+2026-11-27T02:24:31.600Z inject session=session-0005 turn=7 step=32 signals=C inj=e5f6a7b8 chars=309 tokens=251 blind=6 files=4 worstEdits=2 worstStreak=1 worstErrors=0 searched=false measured=no
+2026-11-27T02:25:09.500Z outcome session=session-0005 turn=7 inj=e5f6a7b8 after=C first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:25:49.200Z change session=session-0005 turn=7 inj=e5f6a7b8 after=C tool=advanced_search class=search steps=3
+2026-11-27T02:26:31.600Z measure session=session-0005 turn=7 tool=advanced_search ok=true exit=- cleared=4
+2026-11-27T02:27:08.600Z arm session=session-0006 turn=4 step=15 writes=4
+2026-11-27T02:27:50.100Z inject session=session-0006 turn=4 step=16 signals=C inj=f6a7b8c9 chars=304 tokens=246 blind=5 files=3 worstEdits=2 worstStreak=1 worstErrors=0 searched=false measured=no
+2026-11-27T02:28:28.900Z outcome session=session-0006 turn=4 inj=f6a7b8c9 after=C first=ops_read_files class=other steps=0 before=edit
+2026-11-27T02:29:06.800Z futile session=session-0006 turn=4 inj=f6a7b8c9 after=C count=1 window=6
+2026-11-27T02:29:46.500Z inject session=session-0007 turn=9 step=40 signals=F inj=a7b8c9d0 chars=331 tokens=258 files=2 worstEdits=1 worstStreak=1 worstErrors=3 searched=true measured=no sample="TypeError: Cannot read properties of undefined (reading 'id')"
+2026-11-27T02:30:28.900Z outcome session=session-0007 turn=9 inj=a7b8c9d0 after=F first=ops_read_files class=other steps=1 before=bash
+2026-11-27T02:31:05.900Z arm session=session-0008 turn=3 step=12 writes=3
+2026-11-27T02:31:47.400Z inject session=session-0008 turn=3 step=13 signals=C inj=b8c9d0e1 chars=297 tokens=242 blind=4 files=2 worstEdits=2 worstStreak=1 worstErrors=1 searched=false measured=no
+2026-11-27T02:32:26.200Z outcome session=session-0008 turn=3 inj=b8c9d0e1 after=C first=ops_bash class=shell steps=1 before=edit
+2026-11-27T02:33:04.100Z measure session=session-0008 turn=3 tool=ops_bash ok=true exit=0 cleared=2
+2026-11-27T02:33:43.800Z inject session=session-0009 turn=2 step=9 signals=O inj=c9d0e1f2 chars=318 tokens=254 files=1 worstEdits=2 worstStreak=1 worstErrors=0 searched=false measured=yes:ops_bash:fail
+2026-11-27T02:34:26.200Z outcome session=session-0009 turn=2 inj=c9d0e1f2 after=O first=edit class=edit steps=1 before=edit
+2026-11-27T02:35:03.200Z inject session=session-0010 turn=6 step=27 signals=P inj=d0e1f2a3 chars=325 tokens=257 files=3 worstEdits=2 worstStreak=2 worstErrors=0 searched=false measured=no
+2026-11-27T02:35:44.700Z outcome session=session-0010 turn=6 inj=d0e1f2a3 after=P first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:36:23.500Z inject session-0011 turn=1 step=5 signals=A inj=9a0b1c2d chars=283 tokens=232 blind=4 files=3 worstEdits=3 worstStreak=3 worstErrors=1 searched=false measured=no
+2026-11-27T02:37:01.400Z outcome session-0011 turn=1 inj=9a0b1c2d after=A first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:37:41.100Z inject session-0012 turn=2 step=17 signals=B inj=9a0b1c2d chars=286 tokens=234 blind=5 files=0 worstEdits=1 worstStreak=1 worstErrors=2 searched=false measured=no
+2026-11-27T02:38:23.500Z outcome session-0012 turn=2 inj=9a0b1c2d after=B first=ops_bash class=shell steps=1 before=edit
+2026-11-27T02:39:00.500Z inject session-0013 turn=3 step=8 signals=A inj=9a0b1c2d chars=289 tokens=236 blind=3 files=3 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
+2026-11-27T02:39:42.000Z outcome session-0013 turn=3 inj=9a0b1c2d after=A first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:40:20.800Z inject session-0014 turn=4 step=24 signals=B inj=9a0b1c2d chars=292 tokens=238 blind=4 files=0 worstEdits=1 worstStreak=1 worstErrors=3 searched=false measured=no
+2026-11-27T02:40:58.700Z outcome session-0014 turn=4 inj=9a0b1c2d after=B first=ops_bash class=shell steps=1 before=edit
+2026-11-27T02:41:38.400Z inject session-0015 turn=5 step=6 signals=A inj=9a0b1c2d chars=295 tokens=240 blind=5 files=4 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
+2026-11-27T02:42:20.800Z outcome session-0015 turn=5 inj=9a0b1c2d after=A first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:42:57.800Z inject session-0016 turn=6 step=33 signals=F inj=9a0b1c2d chars=298 tokens=242 blind=3 files=1 worstEdits=1 worstStreak=1 worstErrors=4 searched=false measured=no
+2026-11-27T02:43:39.300Z outcome session-0016 turn=6 inj=9a0b1c2d after=F first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:44:18.100Z inject session-0017 turn=7 step=12 signals=A inj=9a0b1c2d chars=301 tokens=244 blind=4 files=3 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no
+2026-11-27T02:44:56.000Z outcome session-0017 turn=7 inj=9a0b1c2d after=A first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:45:35.700Z inject session-0018 turn=8 step=19 signals=B inj=9a0b1c2d chars=304 tokens=246 blind=5 files=0 worstEdits=1 worstStreak=1 worstErrors=2 searched=false measured=no
+2026-11-27T02:46:18.100Z outcome session-0018 turn=8 inj=9a0b1c2d after=B first=ops_bash class=shell steps=1 before=edit
+2026-11-27T02:46:55.100Z inject session-0019 turn=9 step=4 signals=A inj=9a0b1c2d chars=307 tokens=248 blind=3 files=3 worstEdits=3 worstStreak=3 worstErrors=1 searched=false measured=no
+2026-11-27T02:47:36.600Z outcome session-0019 turn=9 inj=9a0b1c2d after=A first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:48:15.400Z inject session-0020 turn=10 step=41 signals=M inj=9a0b1c2d chars=310 tokens=250 blind=4 files=1 worstEdits=1 worstStreak=1 worstErrors=2 searched=false measured=no
+2026-11-27T02:48:53.300Z outcome session-0020 turn=10 inj=9a0b1c2d after=M first=ops_read_files class=other steps=1 before=edit
+2026-11-27T02:49:33.000Z suppress session=session-0020 turn=10 step=44 reason=done
+2026-11-27T02:50:15.400Z measure session=session-0020 turn=10 tool=ops_bash ok=true exit=0 cleared=2
+2026-11-27T02:50:52.400Z apply pid=41208 logFile=C:/Users/yg/.dsh/logs/better-debug.log A=3 B=2 C=3 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1

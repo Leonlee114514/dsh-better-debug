@@ -1,5 +1,7 @@
 node_modules/
 *.tgz
 *.log
+# 判据体检用的脱敏样本日志是测试输入，不是运行日志
+!test/fixtures/*.log
 .DS_Store
 .agent-tmp/

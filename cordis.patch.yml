@@ -6,7 +6,7 @@
 #   enabled: false              → installed but inert (no listener registered)
 #   repeatEditThreshold: 4      → loosen "same file re-edited" from 3 to 4
 #   repeatErrorThreshold: 3     → loosen "same error repeated" from 2 to 3
-#   noVerifySteps: 3            → 改完 N 步没测量才「上膛」（不等于立刻提醒）
+#   noVerifyWrites: 5           → loosen from 3: 盲改 N 处还没测量才「上膛」（不等于立刻提醒）
 #   maxInjectsPerTurn: 5        → 单轮最多提醒 5 次（默认 3）
 #   changedWindow: 10           → 注入后多少步内算「转向」窗口（默认 6）
 #   measureCommands: "npm|pnpm" → 覆盖「什么命令算测量」的正则
@@ -36,6 +36,12 @@
 # `skills` comes from @deepseek-ai/dsh-skill, which a trimmed profile or another
 # distribution may not mount; the gate does not need it. Both optional services
 # (skills / webServer) are subscribed dynamically via ctx.inject instead.
+#
+# That is the HOST half only. client.js is the opposite: it must declare
+# `inject = ["slots"]` statically, because the browser plugin runs behind the
+# dynamic facade from dsh-cordis-client-runner, whose get trap throws on
+# ctx.inject. Declaring a service there parks the fiber on waitingFor instead of
+# skipping apply(), so the static form is the safe one on the client.
 #
 # NOTE: no `config:` block here either, and that one is about the market.
 # DshMarket's hot mount replays *plain* insert rows only — `scanPatch()` in

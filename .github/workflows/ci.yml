@@ -20,8 +20,29 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: syntax check
         run: npm run check
+      # 死代码与发布契约都是**只在特定形态下才坏**的那类问题：
+      # 前者编辑器不报（2400 行单文件里靠肉眼漏了 5 处），后者只在从 npm 装回来的
+      # 包里坏（CI 跑在克隆仓库里，test/ 一定在，7 条 scripts 全绿）。
+      # 两个检查都是零依赖单文件，跑一次不到 200ms。
+      - name: dead code
+        run: npm run lint
+      - name: publish contract
+        run: npm run pack-check
       # 24 is what the desktop app actually ships (Electron 44 bundles node 24).
       # test:posix re-runs both suites with node:path swapped for the posix
       # implementation, so a Windows runner also covers Linux path semantics.
       - name: behaviour sim (no DSH runtime needed)
         run: npm test
+      # 真打一次包并**在包内**跑测试：这是唯一能发现「files 白名单漏了 test/」的
+      # 检查。上面的 test 跑的是仓库，包里的形状不一样。
+      - name: pack and self-test the tarball
+        # bash 而不是默认 shell：三个 runner 的默认 shell 不同（Windows 是 pwsh），
+        # 而这段要的是 glob 展开 `*.tgz`，写两套等于让一半矩阵测不到。
+        shell: bash
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP"/*.tgz -C "$RUNNER_TEMP/unpacked"
+          cd "$RUNNER_TEMP/unpacked/package"
+          node test/sim.mjs
+          node test/panel.mjs

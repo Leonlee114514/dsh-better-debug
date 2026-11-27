@@ -388,6 +388,12 @@
   }
 
   function render(d) {
+    // 先把上一轮的红条收掉：这一轮的数据是现读的，失败状态不该跨轮存活。
+    // 过去三支分支只 `hidden = false`、全文没有一处置回 true —— 一次 fetch 失败
+    // （或上一代真被 disabled 过）之后，红条会挂着旧文案一直不消失，
+    // 每 5 秒成功刷新也照旧显示「插件当前被关闭」，比没有面板更误导。
+    $('error').hidden = true
+    $('error').textContent = ''
     var inj = d.injects || {}
     var first = d.firstAction || {}
     var turned = d.turned || {}
@@ -442,8 +448,8 @@
       bar('B 同一操作重复报错', bs.B || 0, total, 'b') +
       bar('C 改完没有回路又动手', bs.C || 0, total, 'c') +
       bar('F 同一目标上错误在变种', bs.F || 0, total, 'f') +
-      bar('O 同一组验证来回翻转', bs.O || 0, total, 'e') +
-      bar('P 补丁链：每轮修出下一个失败', bs.P || 0, total, 'd') +
+      bar('O 同一组验证来回翻转 · 实验性', bs.O || 0, total, 'e') +
+      bar('P 补丁链：每轮修出下一个失败 · 实验性', bs.P || 0, total, 'd') +
       bar('M 元闸门：提醒过仍无转向', bs.M || 0, total, 'g')
 
     var adv = d.advanced || {}
@@ -451,9 +457,9 @@
     $('advanced-bars').innerHTML =
       bar('F 阈值（族次数/指纹数）', 0, 1, 'f').replace('<span class="num">0</span>',
         '<span class="num">' + esc(adv.family || '—') + '</span>') +
-      bar('O 阈值（翻转次数）', 0, 1, 'e').replace('<span class="num">0</span>',
+      bar('O 阈值（翻转次数）· 实验性', 0, 1, 'e').replace('<span class="num">0</span>',
         '<span class="num">' + esc(String(adv.oscillation || 0)) + '</span>') +
-      bar('P 阈值（补丁链轮数）', 0, 1, 'd').replace('<span class="num">0</span>',
+      bar('P 阈值（补丁链轮数）· 实验性', 0, 1, 'd').replace('<span class="num">0</span>',
         '<span class="num">' + esc(String(adv.patchChain || 0)) + '</span>') +
       bar('M 阈值（无效注入/开关）', 0, 1, 'g').replace('<span class="num">0</span>',
         '<span class="num">' + esc(adv.meta || '—') + '</span>') +
