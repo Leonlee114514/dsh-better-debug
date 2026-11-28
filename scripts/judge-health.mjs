@@ -215,7 +215,9 @@ if (asJson) {
       skipReason: r.verdict === 'skip' ? skipReasonOf(r) : void 0
     })),
     ok: failed.length === 0,
-    complete: skipped.length === 0
+    complete: skipped.length === 0,
+    // exitCode 与退出码同源，方便调用方在读 JSON 时不靠猜：0 健康 / 1 越界或无数据
+    exitCode: failed.length === 0 && !(results.length > 0 && skipped.length === results.length) ? 0 : 1
   }, null, 2))
 } else {
   console.log('judge-health: ' + logFile)
@@ -240,7 +242,7 @@ if (asJson) {
   if (failed.length > 0) {
     console.log('判据不健康：' + failed.map((r) => r.label).join(' / ') + ' 越界。')
   } else if (skipped.length === results.length) {
-    console.log('没有可用数据：四个判据全部跳过。exit 0 只表示没有失败项，不表示健康 —— 先跑一段真实会话。')
+    console.log('没有可用数据：四个判据全部跳过。exit 1 —— 「没数据」不等于「健康」，先跑一段真实会话。')
   } else if (skipped.length > 0) {
     console.log('判据健康：' + (results.length - skipped.length) + ' 个在阈值内，' +
       skipped.length + ' 个因样本不足跳过（' + skipped.map((r) => r.label).join(' / ') + '）。')
@@ -249,4 +251,11 @@ if (asJson) {
   }
 }
 
-process.exit(failed.length === 0 ? 0 : 1)
+// 退出码三态，不能只用「有没有失败项」两态：
+//   0 = 至少一个判据真的判过，且没有越界；
+//   1 = 有判据越界，或者四个判据一条数据都没有（全 SKIP）。
+// 全 SKIP 过去也走 exit 0，于是「日志一行没写」和「四个数都在阈值内」给出同一个退出码；
+// 本文件被 package.json 的 test:unit 用 && 串在最后，那等于把「没测」记成「测过了」。
+// 只有部分判据 SKIP（其余的判过且在阈值内）仍然 exit 0：样本不足是常态，不是故障。
+const noData = results.length > 0 && skipped.length === results.length
+process.exit(failed.length === 0 && !noData ? 0 : 1)

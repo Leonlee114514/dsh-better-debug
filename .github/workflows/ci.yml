@@ -3,6 +3,8 @@ name: ci
 on:
   push:
     branches: [main]
+    # tag 必须触发：发布只从 tag 出发，否则「打好的包」永远没有在 CI 里跑过一次。
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -21,7 +23,7 @@ jobs:
       - name: syntax check
         run: npm run check
       # 死代码与发布契约都是**只在特定形态下才坏**的那类问题：
-      # 前者编辑器不报（2400 行单文件里靠肉眼漏了 5 处），后者只在从 npm 装回来的
+      # 前者编辑器不报（单文件里靠肉眼漏了 5 处），后者只在从 npm 装回来的
       # 包里坏（CI 跑在克隆仓库里，test/ 一定在，7 条 scripts 全绿）。
       # 两个检查都是零依赖单文件，跑一次不到 200ms。
       - name: dead code
@@ -46,3 +48,53 @@ jobs:
           cd "$RUNNER_TEMP/unpacked/package"
           node test/sim.mjs
           node test/panel.mjs
+          node test/client.mjs
+
+  # 发布只在 tag 上跑。过去 16 个 tag / 20 天全靠本机 npm publish，于是
+  # 「工作区与 tag 不一致」「包里漏 test/」「包内跑不起来」都只能在发布之后才发现
+  # （v0.2.4 断言沾平台、v0.2.5 固定 sleep，两次都是发布后深审才回滚）。
+  # 这里把顺序固定成：版本一致 → verify → 包内自测 → publish --provenance。
+  #
+  # 需要仓库设置里配 NPM_TOKEN（Automation token）；provenance 需要 id-token: write，
+  # 且仓库是 public。缺 token 时这个 job 会红在 publish 那一步，前面的检查照常有效。
+  publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # tag 与 package.json 不一致时立刻停：这正是「发错代码」的唯一入口。
+      - name: tag 必须与 package.json 版本一致
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          echo "tag=$tag package=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag 与 package.json 的 $pkg 不一致"
+            exit 1
+          fi
+      - name: verify
+        run: npm run verify
+      - name: pack and self-test the tarball
+        shell: bash
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP"/*.tgz -C "$RUNNER_TEMP/unpacked"
+          cd "$RUNNER_TEMP/unpacked/package"
+          node test/sim.mjs
+          node test/panel.mjs
+          node test/client.mjs
+          node --check lib/index.js
+      - name: publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
