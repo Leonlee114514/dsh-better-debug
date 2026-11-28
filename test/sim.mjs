@@ -16,6 +16,7 @@ import {
   errorTargetOf,
   failureSetOf,
   failureSetKey,
+  isOpaqueFailSet,
   failureTargetsOf,
   measureKey,
   createMeasureSettler,
@@ -518,6 +519,59 @@ const injections = (injected) =>
   check('C: 改×2→测量→改 不响（测量清零盲改计数）', injected.length === 0, `injections=${injected.length}`)
 }
 
+// ── 14e. A 与 C 互斥：同一步两边都够条件时只发 A（P0-2）
+//
+// 守卫过去写的是 `s.fired.A < 1`，但 fired 的累加在整轮信号收集完之后 ——
+// 同一步里 A 刚 push 时 fired.A 仍是 0，守卫恒放行，A + C 一起发出去，
+// 而两句话说的是同一个现场（「改了 N 次」与「改了 N 处」）。
+//
+// 构造：同一个文件连改 3 次 —— 第 4 步的 pre-step 上 A（同文件 3 次）与 C
+// （盲改 3 处）**同一步**都够条件，断言只发 A。
+//
+// 旧构造是「A1 ×2 + B1 + A1」：那是 C 还要求 measureArmed && wroteWhileArmed（必须
+// 上膛后再写一次）时代的写法 —— 第 4 步只上膛不开口，第 5 步才发 A。改成按
+// blindWrites 直接判之后，第 4 步 C 就先开口了，这条构造不再能测「同一步互斥」。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const A1 = 'C:/work/src/mutex-a.js'
+  const steps = [
+    [(s, c) => edit(A1)(s, c)],
+    [(s, c) => edit(A1)(s, c)],
+    [(s, c) => edit(A1)(s, c)], // 同文件 3 次：下一步 A 与 C 同时成立
+    [],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const aHit = has(injected, '同一个文件累计改了')
+  const cHit = has(injected, '自上次测量以来')
+  check('A/C 互斥：同一步两边都够条件时只发 A', aHit !== void 0 && cHit === void 0, `injections=${injections(injected)} a=${aHit !== void 0} c=${cHit !== void 0}`)
+  check('A/C 互斥：只发一条，不叠成两句话', injected.length === 1, `injections=${injected.length}`)
+}
+
+// ── 14f. C 不再要求「上膛后再写一次」：攒够 noVerifyWrites 就在下一次请求前开口
+//
+// 两段式（measureArmed && wroteWhileArmed）的问题在真机上才看得见：183 个上膛 turn
+// 里 68 个最终没开口，其中 60 个整 turn 一条注入都没有 —— 模型上膛后就去跑命令或
+// 直接收工，第二次写入根本没发生。开口组的强证据转向率 10.4%、未开口组 2.9%。
+// 这条用例锁住的就是「第 3 次写入之后、第 4 次请求之前必须开口」。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const agent = { session: makeSession() }
+  const steps = [
+    [(s, c) => edit('C:/work/src/a.js')(s, c)],
+    [(s, c) => edit('C:/work/src/b.js')(s, c)],
+    [(s, c) => edit('C:/work/src/c.js')(s, c)], // 盲改 3 次：下一步就该开口
+    [],
+    []
+  ]
+  const injected = await runTurn(ctx, agent, { turn: 1, steps })
+  const hit = has(injected, '自上次测量以来')
+  check('C：攒够 3 处就在下一步开口，不需要再写一次', hit !== void 0 && hit.step === 4, hit ? `step=${hit.step}` : 'no injection')
+}
+
 // ── 15. 评审第 5 条：A 提醒 → 有效测量恢复 → 新阶段再盲改，允许第二次提醒
 {
   const ctx = makeCtx()
@@ -822,6 +876,13 @@ const injections = (injected) =>
     [classifyTool('ops_bash', false) === 'shell', 'ops_bash 非测量 → shell'],
     [classifyTool('skill') === 'method', 'skill → method（加载方法论是有效转向）'],
     [classifyTool('web_search') === 'search', 'web_search → search'],
+    [classifyTool('run_code', true) === 'verify', 'run_code + 测量 → verify'],
+    [classifyTool('run_code', false) === 'other', 'run_code 非测量 → other（不冒充 shell / edit）'],
+    [isMeasurement('run_code', { code: 'npm test' }, cfgLike) === true, 'run_code 里跑白名单命令是测量'],
+    [
+      isMeasurement('run_code', { code: '// 测试\nconst x = 1', description: '测试' }, cfgLike) === false,
+      'run_code 只提到测试不算测量（measureIntent 不参与）'
+    ],
     [isMeasurement('ops_bash', { command: 'npm test' }, cfgLike) === true, 'npm test 是测量'],
     [isMeasurement('ops_bash', { command: 'ls -la' }, cfgLike) === false, 'ls 不是测量'],
     [isMeasurement('ops_bash', { command: 'npm test', description: 'x' }, cfgLike) === true, '命令命中即可'],
@@ -1130,7 +1191,15 @@ check(
     [[...measureDirs({ command: 'cd /usr/local && npm test' })], ['/usr/local'], '首段不是单个字母 → 不动'],
     // WSL 把 C 盘挂在 /mnt/c：同一台机器上 bash 走 WSL、写文件走 Windows 时同样不相交。
     [[...measureDirs({ command: 'cd /mnt/c/work/projB && npm test' })], ['c:/work/projB'], 'WSL 挂载点方言归一'],
-    [[...measureDirs({ command: 'cd /mnt/data/x && npm test' })], ['/mnt/data/x'], '挂载点不是单个字母 → 不动']
+    [[...measureDirs({ command: 'cd /mnt/data/x && npm test' })], ['/mnt/data/x'], '挂载点不是单个字母 → 不动'],
+    // P0：命令里的路径不能一律按文件剥父目录。`tsc -p C:/work` 的末段没有点，那是**目录**，
+    // 剥成 `c:` 之后作为前缀能匹配整个 C 盘，一次测量洗白全盘（实测 4 条清到 1 条）。
+    [[...measureDirs({ command: 'npx tsc --noEmit -p C:/work' })], ['C:/work'], '末段无扩展名 → 当目录'],
+    [[...measureDirs({ command: 'python -m pytest C:/work/tests' })], ['C:/work/tests'], '目录参数不被当成文件'],
+    [[...measureDirs({ command: 'npx vitest run C:/work/tests/a.test.ts' })], ['C:/work/tests'], '文件参数才剥一层'],
+    // 期望值写原始大小写：win32 折小写比较，linux 变体逐字符比较，写 'c:' 只在 Windows 上过。
+    [[...measureDirs({ command: 'npm test -- C:/a.ts' })], ['C:'], '根下文件剥出来就是盘符根（交给 settler 精确匹配）'],
+    [[...measureDirs({ command: 'cd C:/ && npm test' })], ['C:'], '显式整盘：cd 分支就该给盘符根']
   ]
   const bad = cases
     .filter(([actual, expected]) => !sameDirs(actual, expected))
@@ -2334,11 +2403,10 @@ check(
   }
   // 根 run_code 的参数是 code 而不是 command。0.3.5 之前这里一律 false，
   // 于是「在 run_code 里跑测试」既不算测量也解不开 C —— PTC 整层失明。
-  // 现在读 code 文本里的命令意图（measureCommands / measureIntent），
-  // 命中即算测量；measureDirs 同步从 code 里抽目录，避免一次
-  // 「顺手跑了个测试」把所有路径的盲改一起清零。
+  // 现在读 code 文本里的命令白名单（只认 measureCommands），命中即算测量；
+  // measureDirs 同步从 code 里抽目录，避免一次「顺手跑了个测试」把所有路径的盲改一起清零。
   check(
-    'run_code 里的 npm test 算测量（读 code 文本里的命令意图）',
+    'run_code 里的 npm test 算测量（code 命中命令白名单）',
     isMeasurement('run_code', { code: 'await tools.bash({command:"npm test"})', description: '跑测试' }, cfgLike) === true,
     'isMeasurement(run_code)=' + isMeasurement('run_code', { code: 'await tools.bash({command:"npm test"})' }, cfgLike)
   )
@@ -2347,10 +2415,18 @@ check(
     isMeasurement('run_code', { code: 'const x = 1 + 1' }, cfgLike) === false,
     'isMeasurement(plain run_code)=' + isMeasurement('run_code', { code: 'const x = 1 + 1' }, cfgLike)
   )
+  // 只认白名单的核心理由：measureIntent 含裸 test / measure / diagnos，
+  // 对整段 code 测等于「注释里提到测试就算测过了」，反而把 C 洗白。
   check(
-    'run_code 归类为 other（不冒充 verify / edit）',
-    classifyTool('run_code', false) === 'other' && classifyTool('run_code', true) === 'other',
-    classifyTool('run_code', true)
+    'run_code 里只是提到测试（注释 / description）不算测量',
+    isMeasurement('run_code', { code: '// 记得测试一下移位的逻辑\nconst x = 1 + 1', description: '跑测试' }, cfgLike) === false,
+    'isMeasurement(intent-only run_code)=' +
+      isMeasurement('run_code', { code: '// 记得测试一下移位的逻辑\nconst x = 1 + 1', description: '跑测试' }, cfgLike)
+  )
+  check(
+    'run_code 归类跟着测量判定走：测量 → verify，否则 other',
+    classifyTool('run_code', true) === 'verify' && classifyTool('run_code', false) === 'other',
+    'true=' + classifyTool('run_code', true) + ' false=' + classifyTool('run_code', false)
   )
 
   // 56a. PTC 子调用里的测量算转向：A 提醒之后在 run_code 里跑测试，
@@ -3089,6 +3165,32 @@ const tscB = "src/b.ts(3,1): error TS2304: Cannot find name 'foo'."
   check('settler ok：futile 清零', s.futile === 0, 'futile=' + s.futile)
 }
 
+// ── 30d2：C 的重新武装只认「兑现了上膛」的成功测量
+//
+// 旧版无条件 `if (ok) s.fired.C = 0`：真机 340 条 ok 测量里只有 38 条 cleared > 0
+// （88.8% 清不掉），等于每跑一次命令就洗白一次 —— 盲改计数一路累加，同一个 turn
+// 里 C 连响三次（blind 4 → 8 → 12），全量 18 条同 turn 重复开口都出自这里。
+// A 在 30 号用例里早已改成有条件，C 是遗留的不一致。
+{
+  // 带目录 + 目录不匹配 + 无 PTC 写入：ok 但什么都没兑现 → C 不该重新武装。
+  const miss = settlerState({
+    streakEdits: new Map([['C:/work/src/a.js', 3]]),
+    blindWrites: 4,
+    fired: { A: 0, B: 0, C: 1, F: 0, P: 0, M: 0 }
+  })
+  const missCleared = settler(miss, { tool: 'bash', args: { command: 'cd C:/other && npm test' }, ok: true, exit: 0, atStep: 4, text: 'ok' })
+  check('settler C：ok 但 cleared=0 → 不重新武装', missCleared === 0 && miss.fired.C === 1, 'cleared=' + missCleared + ' firedC=' + miss.fired.C)
+
+  // 同一现场在有目录限定的测量里被清掉 → 重新武装。
+  const hit = settlerState({
+    streakEdits: new Map([['C:/work/src/a.js', 3]]),
+    blindWrites: 4,
+    fired: { A: 0, B: 0, C: 1, F: 0, P: 0, M: 0 }
+  })
+  const hitCleared = settler(hit, { tool: 'bash', args: { command: 'cd C:/work && npm test' }, ok: true, exit: 0, atStep: 4, text: 'ok' })
+  check('settler C：cleared>0 的 ok → 重新武装', hitCleared === 1 && hit.fired.C === 0, 'cleared=' + hitCleared + ' firedC=' + hit.fired.C)
+}
+
 // 30e：失败测量无条件推进 failSeq —— 哪怕一条条目都解析不出来（P1-11 的直接断言）。
 {
   const s = settlerState({ writeSeq: 1, lastFailWriteSeq: 0 })
@@ -3183,6 +3285,92 @@ const tscB = "src/b.ts(3,1): error TS2304: Cannot find name 'foo'."
   const wslOther = settlerState({ streakEdits: new Map([['c:/users/x/src/a.js', 3]]) })
   const wslMiss = settler(wslOther, { tool: 'bash', args: { command: 'cd /mnt/data/x && npm test' }, ok: true, exit: 0, atStep: 6, text: 'ok' })
   check('settler WSL 方言：/mnt/data 不是盘符挂载点，不清', wslMiss === 0 && wslOther.streakEdits.size === 1, 'cleared=' + wslMiss)
+}
+
+// ── 30k：解除武装不能只看 cleared（PTC 写入没有路径可匹配）
+//
+// cleared 只由「按路径清 streakEdits」产生，而 PTC 写入（run_code 里的 tools.write）
+// 按设计不进 streakEdits —— 代码文本里看不出写到哪个目录。于是纯 PTC 会话里
+// cleared 恒为 0，measureArmed / wroteWhileArmed 永远是 true，C 退化成「每次写入都开口」。
+// 实测：两次成功测量 cleared=0 之后 blindWrites 仍在涨（session-26d0c3f5 turn 25）。
+{
+  // 纯 PTC 会话：只有 blindWrites，streakEdits 空。带 workdir 的测量也必须解除。
+  const s = settlerState({ blindWrites: 9, ptcWrites: 9, measureArmed: true, wroteWhileArmed: true })
+  const cleared = settler(s, { tool: 'bash', args: { command: 'cd C:/work && npm test' }, ok: true, exit: 0, atStep: 9, text: 'ok' })
+  check('settler PTC：streakEdits 空时 cleared 仍为 0', cleared === 0, 'cleared=' + cleared)
+  check('settler PTC：带目录的测量照样解除武装', s.measureArmed === false && s.wroteWhileArmed === false, 'armed=' + s.measureArmed + ' wrote=' + s.wroteWhileArmed)
+  check('settler PTC：盲改与 PTC 计数一起归零', s.blindWrites === 0 && s.ptcWrites === 0, 'blind=' + s.blindWrites + ' ptc=' + s.ptcWrites)
+
+  // 裸测量（无目录）：本来就管全部路径，即使 streakEdits 空也要解除。
+  const bare = settlerState({ blindWrites: 5, measureArmed: true, wroteWhileArmed: true })
+  const bareCleared = settler(bare, { tool: 'bash', args: { command: 'npm test' }, ok: true, exit: 0, atStep: 3, text: 'ok' })
+  check('settler 裸测量：没有 streakEdits 也解除武装', bareCleared === 0 && bare.measureArmed === false && bare.blindWrites === 0, 'cleared=' + bareCleared + ' armed=' + bare.measureArmed)
+
+  // 反向守卫：带目录 + 目录不匹配 + 没有 PTC 写入 → 仍然保留武装。
+  // 「别的目录的测量不该替这个目录洗白」这条设计不能顺手破掉。
+  const miss = settlerState({
+    streakEdits: new Map([['c:/work/src/a.js', 3]]),
+    blindWrites: 4,
+    measureArmed: true,
+    wroteWhileArmed: true
+  })
+  const missCleared = settler(miss, { tool: 'bash', args: { command: 'cd C:/other && npm test' }, ok: true, exit: 0, atStep: 4, text: 'ok' })
+  check('settler 目录不匹配：没有 PTC 写入时武装保留', missCleared === 0 && miss.measureArmed === true && miss.blindWrites === 4, 'cleared=' + missCleared + ' armed=' + miss.measureArmed)
+
+  // 开关关掉时连 PTC 分支也不许动（30c 的契约同样适用于新加的两支）。
+  const off = createMeasureSettler({ cfg: { decayEditsOnVerify: false } })
+  const offState = settlerState({ blindWrites: 9, ptcWrites: 9, measureArmed: true, wroteWhileArmed: true })
+  off(offState, { tool: 'bash', args: {}, ok: true, exit: 0, atStep: 9, text: 'ok' })
+  check('settler 开关关掉：PTC 计数与武装都保持原样', offState.measureArmed === true && offState.blindWrites === 9 && offState.ptcWrites === 9, 'armed=' + offState.measureArmed + ' blind=' + offState.blindWrites)
+}
+
+// ── 30l：盘符根候选只能精确匹配，不能当整盘前缀（P0）
+//
+// 候选侧的 dirOfMatch 已经保证「目录参数不剥父目录」，但根下的文件（`npm test -- C:/a.ts`）
+// 剥出来就是 `c:`，而 `candidate.startsWith('c:/')` 对 C 盘任何文件都成立 ——
+// 实测一条这样的测量把 4 条 streakEdits 清到 1 条，C 在 C 盘上等于失效。
+// 方向与 dirOfMatch 一致：宁可少清一次，不能把整盘洗白。
+{
+  const mk = () => settlerState({
+    // 大写盘符：settler 的匹配是逐字符的（大小写折叠发生在 normDir / dirOf 里，
+    // 而 test:linux 变体把 CASE_INSENSITIVE 关掉后就不再折），写小写会在 linux 变体红。
+    streakEdits: new Map([
+      ['C:/work/a.ts', 3],
+      ['C:/work/b.ts', 3],
+      ['C:/work/sub/c.js', 3],
+      ['D:/other/x.js', 3]
+    ]),
+    blindWrites: 4,
+    measureArmed: true,
+    wroteWhileArmed: true
+  })
+
+  // 根下文件的测量不该替 c:/work/** 洗白
+  const s1 = mk()
+  const c1 = settler(s1, { tool: 'bash', args: { command: 'npm test -- C:/a.ts' }, ok: true, exit: 0, atStep: 5, text: 'ok' })
+  check('settler 盘符根：根下文件的测量不洗白子目录', c1 === 0 && s1.streakEdits.size === 4, 'cleared=' + c1 + ' size=' + s1.streakEdits.size)
+  check('settler 盘符根：武装保留', s1.measureArmed === true && s1.wroteWhileArmed === true, 'armed=' + s1.measureArmed)
+
+  // 显式整盘（workdir:'C:/'）同样只精确匹配：语义上它确实管辖全盘，但候选形态与
+  // 「根下文件剥出来的 c:」不可区分，所以按保守方向处理。
+  const s2 = mk()
+  const c2 = settler(s2, { tool: 'bash', args: { workdir: 'C:/', command: 'npm test' }, ok: true, exit: 0, atStep: 5, text: 'ok' })
+  check('settler 盘符根：显式整盘也不洗白子目录', c2 === 0 && s2.streakEdits.size === 4, 'cleared=' + c2 + ' size=' + s2.streakEdits.size)
+
+  // 同盘符根精确相等仍然要清 —— 守卫是「不当前缀」，不是「永不清」。
+  const s3 = settlerState({
+    streakEdits: new Map([['C:/a.ts', 3]]),
+    blindWrites: 4,
+    measureArmed: true,
+    wroteWhileArmed: true
+  })
+  const c3 = settler(s3, { tool: 'bash', args: { command: 'npm test -- C:/a.ts' }, ok: true, exit: 0, atStep: 5, text: 'ok' })
+  check('settler 盘符根：同一条路径仍要清', c3 === 1 && s3.measureArmed === false, 'cleared=' + c3 + ' armed=' + s3.measureArmed)
+
+  // 正常的目录候选不受影响（回归保护：别把守卫写成对 c:/work 也生效）
+  const s4 = mk()
+  const c4 = settler(s4, { tool: 'bash', args: { workdir: 'C:/work', command: 'npm test' }, ok: true, exit: 0, atStep: 5, text: 'ok' })
+  check('settler 盘符根：普通目录候选照旧清自己那一层', c4 === 3 && s4.streakEdits.size === 1, 'cleared=' + c4 + ' size=' + s4.streakEdits.size)
 }
 
 // ── 31. createDeliverer：不经过 apply，直接断言日志形状与消息形状（P1-8）
@@ -3691,6 +3879,318 @@ const tscB = "src/b.ts(3,1): error TS2304: Cannot find name 'foo'."
   check('指纹：只漂行号要合并', errorFingerprint(locA) === errorFingerprint(locB), errorFingerprint(locA))
   check('run_code 里的 npm test 算测量', isMeasurement('run_code', { code: 'await tools.bash({command:"npm test"})' }, cfgLike) === true, 'run_code')
 }
+// ── 30m：measureKey 必须认 run_code 的 code（P0）
+//
+// O 用 measureKey 给「同一条验证回路」分组。过去只读 command / script_path，
+// run_code 的脚本全落在空串上 ⇒ 三条不同的验证回路塌成同一个 key，
+// O 会把「换了验证方式」读成「同一条回路在振荡」。
+{
+  const k1 = measureKey('run_code', { code: 'npm test' })
+  const k2 = measureKey('run_code', { code: 'cargo build' })
+  const k3 = measureKey('run_code', {})
+  check('measureKey：run_code 的 code 参与分组', k1 !== k2 && k1 !== k3 && k2 !== k3, k1 + ' / ' + k2 + ' / ' + k3)
+  check('measureKey：run_code 带出可读 key', k1 === 'run_code|npm test', k1)
+
+  // 命令行里连续空白不该造出第二个 key；脚本里的换行有语义，压掉就会撞 key。
+  check('measureKey：命令行压空白', measureKey('bash', { command: 'npx  tsc   --noEmit' }) === 'bash|npx tsc --noEmit', measureKey('bash', { command: 'npx  tsc   --noEmit' }))
+  const twoLines = measureKey('run_code', { code: 'const a = 1\nawait write(a)' })
+  const oneLine = measureKey('run_code', { code: 'const a = 1 await write(a)' })
+  check('measureKey：脚本换行不塌缩', twoLines !== oneLine, twoLines + ' vs ' + oneLine)
+}
+
+// ── 30n：超长单行不能让指纹退化（P0）
+//
+// 惰性量词 + 边界断言在单条超长行上逐列重试 ⇒ O(n^2)。实测旧版 50 000 字符 3 974 ms、
+// 100 000 字符 18 725 ms，而工具输出里 hex dump / minified 单行是常态，等于每次结果都付这个代价。
+// 阈值取得很松（2 s，新实现实测 < 10 ms），因为慢盘上跑 CI 不该被一个性能断言判红。
+{
+  const timeIt = (fn) => {
+    const t0 = globalThis.performance.now()
+    fn()
+    return globalThis.performance.now() - t0
+  }
+  const longLine = 'a'.repeat(100000)
+  const ms1 = timeIt(() => errorFingerprint('C:/' + longLine))
+  check('性能：10 万字符单行指纹', ms1 < 2000, ms1.toFixed(1) + 'ms')
+  const ms2 = timeIt(() => failureSetOf('Collecting ...' + ' '.repeat(40000) + 'ok'))
+  check('性能：4 万空格单行失败集', ms2 < 2000, ms2.toFixed(1) + 'ms')
+  const ms3 = timeIt(() => failureSetOf('tests/test_a.py .. [100%]'))
+  check('性能：pytest 进度行不回溯', ms3 < 2000, ms3.toFixed(1) + 'ms')
+}
+
+// ── 71. QUIET_PATTERN 的两侧：祈使句静音、描述性句子必须继续说话（第三轮 P1-3）
+//
+// 旧正则里含裸的「先试试」「快速试」「别折腾」，于是「我先试试复现一下这个 bug」
+// 这种**描述自己打算怎么做事**的句子把整轮静音了 —— 而那恰恰是最该被提醒的现场。
+// 20c 的反例（I searched before editing）不含任何旧条目，所以一直绿，覆盖不到中文描述性用法。
+// 这里两种用法各列一组：祈使的被静音、描述性的照常开口，任一条判反就红。
+{
+  const ctx = makeCtx()
+  apply(ctx, { logFile: '' })
+  const injectsFor = async (quietText, id) => {
+    const agent = { session: makeSession({ id }) }
+    const steps = [
+      [(s, c) => edit('C:/work/src/q.js')(s, c)],
+      [(s, c) => edit('C:/work/src/q.js')(s, c)],
+      [(s, c) => edit('C:/work/src/q.js')(s, c)],
+      [(s, c) => edit('C:/work/src/q.js')(s, c)],
+      []
+    ]
+    const injected = await runTurn(ctx, agent, { turn: 1, steps, quietText })
+    return injected.length
+  }
+  const imperative = [
+    '别搜了，直接改',
+    '先别搜，直接改',
+    '先试试直接改吧',
+    '不用搜了，直接动手',
+    'just do it',
+    "don't search, just edit",
+    'skip the search and edit it'
+  ]
+  const descriptive = [
+    '我先试试复现一下这个 bug',
+    '先试试能不能稳定复现，再决定改哪里',
+    '这个改动我想先试试性能有没有变差',
+    '我快速试一下这个假设',
+    '让我快速试跑一次测试',
+    '别折腾这个依赖了，它跟问题无关',
+    '这个文件我直接改过了，先看结果',
+    '不用搜索我也知道根因，但我会先跑一遍测试确认',
+    'I already searched, so let me look at what came back'
+  ]
+  const quietMisses = []
+  for (let i = 0; i < imperative.length; i += 1) {
+    const n = await injectsFor(imperative[i], 's-quiet-imp-' + i)
+    if (n !== 0) quietMisses.push(imperative[i] + ' → ' + n)
+  }
+  check('QUIET：祈使句（中英）整轮静音', quietMisses.length === 0, quietMisses.join(' | '))
+  const speakMisses = []
+  for (let i = 0; i < descriptive.length; i += 1) {
+    const n = await injectsFor(descriptive[i], 's-quiet-desc-' + i)
+    if (n === 0) speakMisses.push(descriptive[i])
+  }
+  check('QUIET：描述性提到搜索/尝试时照常开口（误静音比漏静音更贵）', speakMisses.length === 0, speakMisses.join(' | '))
+}
+
+// ── 72. A 的重新武装必须有新事实（第三轮 P1-2）
+//
+// 「测量」不等于「新事实」：在 D:/elsewhere 跑一次测试，管不到 C:/work 下的现场，
+// 那里一条盲改都没被清掉 —— 此时重新武装 A，等于允许对同一个现场把同一句话说第二遍。
+{
+  const s = settlerState({
+    streakEdits: new Map([['C:/work/src/a.ts', 5]]),
+    blindWrites: 5,
+    measureArmed: true,
+    wroteWhileArmed: true,
+    fired: { A: 1, B: 0, C: 1, F: 0, P: 0, M: 0 }
+  })
+  settler(s, { tool: 'bash', args: { command: 'npm test', workdir: 'D:/elsewhere' }, ok: false, exit: 1, atStep: 9, text: '[exit code: 1]' })
+  check('settler A：管不到现场的失败测量不重新武装', s.fired.A === 1, 'fired.A=' + s.fired.A)
+  check(
+    'settler A：管不到现场的测量既不清也不加',
+    s.streakEdits.size === 1 && s.blindWrites === 5,
+    'size=' + s.streakEdits.size + ' blind=' + s.blindWrites
+  )
+  settler(s, { tool: 'bash', args: { command: 'npm test', workdir: 'C:/work' }, ok: false, exit: 1, atStep: 10, text: '[exit code: 1]' })
+  check('settler A：清掉现场之后才重新武装', s.streakEdits.size === 0 && s.fired.A === 0, 'size=' + s.streakEdits.size + ' fired.A=' + s.fired.A)
+}
+
+// ── 73. 补丁链没到阈值时 B 必须照常开口（第三轮 P1-4）
+//
+// 旧实现里 repairChain >= 1 就把 B 的评估 break 掉、还在收尾无条件 splice 一次并记 fired，
+// 于是「失败 → 改 → 仍失败」从第二轮起一条注入都没有，直到第三轮 P 才开口 ——
+// 而 P 要 patchChainThreshold（默认 3）次。反事实把阈值抬到 10 让 P 永不开口，
+// 旧代码就是全程静默。这里两个阈值都要求第 3 步（第二次同指纹失败）有 B。
+{
+  const tscFail =
+    "src/a.ts(12,9): error TS2322: Type 'string' is not assignable to type 'number'.\n[exit code: 1]"
+  const runChain = async (extra, id) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '', ...extra })
+    const agent = { session: makeSession({ id }) }
+    const verify = (n) => (s, c, step) =>
+      tool('v' + n, 'ops_bash', { args: { command: 'npx tsc --noEmit', description: 'typecheck' }, text: tscFail })(s, c, step)
+    const steps = [
+      [verify(1), (s, c) => edit('C:/work/src/a.ts')(s, c)],
+      [verify(2), (s, c) => edit('C:/work/src/a.ts')(s, c)],
+      [verify(3), (s, c) => edit('C:/work/src/a.ts')(s, c)],
+      [verify(4)],
+      [],
+      []
+    ]
+    return runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const def = await runChain({}, 's-chain-def')
+  const first = def.find((item) => item.texts.some((text) => text.includes('重复报错')))
+  check('补丁链：默认阈值下 B 在第 2 次同指纹失败时就开口', first !== void 0 && first.step === 3, def.map((x) => x.step).join(','))
+  const far = await runChain({ patchChainThreshold: 10 }, 's-chain-far')
+  const firstFar = far.find((item) => item.texts.some((text) => text.includes('重复报错')))
+  check('补丁链：P 永不开口时 B 也不能被压掉', firstFar !== void 0 && firstFar.step === 3, far.map((x) => x.step).join(','))
+}
+
+// ── 74. α：易变读数归一（耗时/端口/pid/时间戳），但失败内容里的数字必须留着
+//
+// 同一条失败每轮换一次读数时，指纹跟着换，三处同时失效：O 永远数不到「同一个失败
+// 回来了」、P 的 shrunk/unchanged 双双失效（chain 一路涨）、B 的 episode 被拆成 N 份。
+// 反方向同样致命：把数字全折成 <num> 会让 case-1 与 case-2 塌成同一条（0.3.1 的误报）。
+// 所以这一节两侧都断言：读数是噪声，用例编号是语义。
+{
+  const one = (a, b, label) =>
+    check(`α：${label}`, failureSetKey(failureSetOf(a)) === failureSetKey(failureSetOf(b)), `${failureSetKey(failureSetOf(a))} vs ${failureSetKey(failureSetOf(b))}`)
+  const differ = (a, b, label) =>
+    check(`α：${label}`, failureSetKey(failureSetOf(a)) !== failureSetKey(failureSetOf(b)), `${failureSetKey(failureSetOf(a))} vs ${failureSetKey(failureSetOf(b))}`)
+  one(
+    'AssertionError: boom (took 37ms)\n[exit code: 1]',
+    'AssertionError: boom (took 41ms)\n[exit code: 1]',
+    '耗时读数变化不换身份'
+  )
+  one(
+    'Error: connect ECONNREFUSED 127.0.0.1:3001\n[exit code: 1]',
+    'Error: connect ECONNREFUSED 127.0.0.1:3002\n[exit code: 1]',
+    '端口变化不换身份'
+  )
+  one(
+    'not ok 1 - alpha\n  duration_ms: 269.2532\n[exit code: 1]',
+    'not ok 1 - alpha\n  duration_ms: 512.81\n[exit code: 1]',
+    'TAP duration_ms 变化不换身份'
+  )
+  one(
+    'FAILED at 2026-11-28T06:26:01Z: boom\n[exit code: 1]',
+    'FAILED at 2026-11-29T11:02:44Z: boom\n[exit code: 1]',
+    '时间戳变化不换身份'
+  )
+  // 反例：这三组数字是失败内容，归一化就越界了。
+  differ(
+    'AssertionError: case-1 failed\n[exit code: 1]',
+    'AssertionError: case-2 failed\n[exit code: 1]',
+    '用例编号仍要分开（裸数字不动）'
+  )
+  differ(
+    'AssertionError: expected 3 to be 4\n[exit code: 1]',
+    'AssertionError: expected 3 to be 5\n[exit code: 1]',
+    '断言里的字面量仍要分开'
+  )
+  // 耗时归一不得把「同一行里的另一个数」一起吃掉。
+  differ(
+    'FAIL src/a.test.ts > suite > case 1\nAssertionError: boom\n[exit code: 1]',
+    'FAIL src/a.test.ts > suite > case 2\nAssertionError: boom\n[exit code: 1]',
+    'vitest 述语里的用例序号仍要分开'
+  )
+}
+
+// ── 75. β：解析不出失败身份 ≠ 失败面收缩
+//
+// 旧实现在「原文有失败证据、但抽不出任何条目」时返回空集合。空集合在 P 的 shrunk 判据里
+// 满足 `current.size < previous.size && every(...)`（空集恒真）⇒ 一条认不出的红被读成
+// 「失败面收缩了」，repairChain 直接清零。真正的补丁链会在第一轮就被洗白。
+// 所以空集要分两种：确实没有失败（清链是正确行为），和解析不出来（什么都不许动）。
+{
+  const opaque = failureSetOf('[exit code: 1]')
+  check('β：只有退出码 → 标记为「解析不出」而不是普通空集', isOpaqueFailSet(opaque) === true, 'size=' + opaque.size)
+  check('β：解析不出的集合仍然 size===0（不伪造条目）', opaque.size === 0, 'size=' + opaque.size)
+  const plain = failureSetOf('PASS a\nPASS b')
+  check('β：确实没有失败 → 普通空集，不是 opaque', isOpaqueFailSet(plain) === false, 'size=' + plain.size)
+
+  const one = failureSetOf(tscA)
+  const s = settlerState({ writeSeq: 2, lastFailWriteSeq: 1, repairChain: 2, lastFailSet: one, seenFailTargets: failureTargetsOf(one) })
+  settler(s, { tool: 'bash', args: { command: 'npm test' }, ok: false, exit: 1, atStep: 3, text: '[exit code: 1]' })
+  check('β：认不出的红不清补丁链（也不会被读成收缩）', s.repairChain === 2, 'chain=' + s.repairChain)
+  check('β：认不出的红不改写 lastFailSet', s.lastFailSet === one, 'size=' + s.lastFailSet.size)
+
+  // 对照：真的没有失败（健康输出）时清链是正确行为，不能被 β 挡住。
+  const okState = settlerState({ writeSeq: 2, lastFailWriteSeq: 1, repairChain: 2, lastFailSet: one, seenFailTargets: failureTargetsOf(one) })
+  settler(okState, { tool: 'bash', args: { command: 'npm test' }, ok: true, exit: 0, atStep: 3, text: 'ok 12 tests passed' })
+  check('β：一次成功测量照常清链', okState.repairChain === 0 && okState.lastFailSet.size === 0, 'chain=' + okState.repairChain)
+}
+
+// ── 76. γ：run_code 的测量管辖范围只看 tools.<name>({...}) 的参数字面量
+//
+// 旧实现把整段 code 当命令文本扫路径，于是 import 的 `./src/a.ts`、注释里的 URL、
+// 甚至 `node_modules/jest/bin/jest.js` 这种字符串字面量都成了「测试覆盖的目录」。
+// 后果不是误报而是**洗白**：一次跟被测目录无关的 run_code 会把那个目录的盲改计数清零，
+// C 与 A 从此对这个现场闭嘴。
+{
+  const codeCases = [
+    [
+      [...measureDirs({ code: "await tools.bash({ command: 'npm test', workdir: 'C:/work' })" })],
+      ['C:/work'],
+      'tools.bash 的 workdir 是管辖目录'
+    ],
+    [
+      [...measureDirs({ code: "await tools.bash({ command: 'npx tsc --noEmit', workdir: 'C:/repo/src' })" })],
+      ['C:/repo/src'],
+      'tools.bash 带 workdir 的 typecheck'
+    ],
+    [
+      [...measureDirs({ code: "await tools.read({ file_path: 'src/a.ts', workdir: 'C:/w' })" })].sort(),
+      ['C:/w', 'C:/w/src'].sort(),
+      '相对 file_path 按 workdir 落地'
+    ],
+    [[...measureDirs({ code: "import x from './src/a.ts'" })], [], 'import 路径不是管辖目录'],
+    [
+      [...measureDirs({ code: '// see https://mypy.readthedocs.io/en/stable/errors.html' })],
+      [],
+      '注释里的 URL 不是管辖目录'
+    ],
+    [
+      [...measureDirs({ code: "const p = 'node_modules/jest/bin/jest.js'" })],
+      [],
+      '字符串字面量不是管辖目录'
+    ],
+    [[...measureDirs({ code: 'await tools.bash()' })], [], '无参调用不猜'],
+    [[...measureDirs({ code: 'await write(C:/work/src/a.ts)' })], [], '非 tools.* 调用不猜']
+  ]
+  const badCode = codeCases
+    .filter(([actual, expected]) => !sameDirs(actual, expected))
+    .map(([actual, , label]) => `${label} → [${actual.join(',')}]`)
+  check('γ：run_code 管辖范围只认 tools.* 参数字面量', badCode.length === 0, badCode.length === 0 ? `${codeCases.length} 项` : badCode.join(' | '))
+}
+
+// ── 77. δ：没有退出码时不能默认成功
+//
+// 宿主不一定给退出码（`ops_bash` 之外的通道、被截断的输出、pwsh 的某些错误形态）。
+// 旧实现在 exit 缺失时一律 `ok = true`，于是一条红输出被记成「有效测量」：
+// C 被重新武装（`if (ok && settled) s.fired.C = 0`），同一个现场立刻能再喊一遍。
+// 新口径：有退出码就以退出码为准；没有时才看尾部三行有没有失败证据。
+//
+// 形状必须是「攒够 3 次盲改 → 测量 → 再攒 3 次」，缺一段都测不到差异：
+//   · 测量前不足 noVerifyWrites(3) 次编辑 → 根本没上膛，C 不开也不重启；
+//   · 测量后不足 3 次编辑 → blindWrites 回不到阈值，重新武装与否都看不出来。
+// 三条编辑各有自己的路径：同一条路径连改 3 次会先触发 A，B 也会挤进来，
+// 断言就分不清是哪条信号在说话。
+{
+  const runNoExit = async (text, id) => {
+    const ctx = makeCtx()
+    apply(ctx, { logFile: '' })
+    const agent = { session: makeSession({ id }) }
+    const steps = [
+      [(s, c) => edit('C:/work/src/d1.js')(s, c)],
+      [(s, c) => edit('C:/work/src/d2.js')(s, c)],
+      [(s, c) => edit('C:/work/src/d3.js')(s, c)],
+      [(s, c, st) => tool('m' + id, 'ops_bash', { args: { command: 'npm test', description: '跑测试' }, text, isError: false })(s, c, st)],
+      [(s, c) => edit('C:/work/src/d4.js')(s, c)],
+      [(s, c) => edit('C:/work/src/d5.js')(s, c)],
+      [(s, c) => edit('C:/work/src/d6.js')(s, c)],
+      []
+    ]
+    return runTurn(ctx, agent, { turn: 1, steps })
+  }
+  const redText = 'FAIL test/a.test.mjs\nAssertionError: case-1 failed'
+  const red = await runNoExit(redText, 'd-red')
+  check(
+    'δ：无退出码的失败输出不重新武装 C（第 4 步之后不再开口）',
+    injections(red) === 'step4',
+    `开口 = ${injections(red)}`
+  )
+  const green = await runNoExit('ok 12 tests passed', 'd-green')
+  check(
+    'δ：无退出码的成功输出照常重新武装 C（第 4 步与第 8 步各一条）',
+    injections(green) === 'step4,step8',
+    `开口 = ${injections(green)}`
+  )
+}
+
 // ── 29. 导出形状
 check('导出 name', name === 'dsh-better-debug', name)
 const failed = results.filter((r) => !r.pass)

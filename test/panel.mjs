@@ -65,7 +65,7 @@ function check(label, pass, detail) {
   const measured = parseLine('2026-11-07T02:38:39.001Z measure session=s-1 turn=39 tool=ops_bash ok=true exit=0 cleared=2')
   const arm = parseLine('2026-11-07T02:38:30.001Z arm session=s-1 turn=39 step=8 writes=3')
   const applyLine = parseLine(
-    '2026-11-07T01:24:19.226Z apply pid=17884 logFile=C:/x/better-debug.log A=3 B=2 C=2 budget=3 window=6 panel=true'
+    '2026-11-07T01:24:19.226Z apply pid=17884 logFile=C:/x/better-debug.log A=3 B=2 C=3 budget=3 window=6 panel=true'
   )
   check(
     'parseLine 认 inject（含 inj / tokens / measured）',
@@ -95,7 +95,7 @@ function check(label, pass, detail) {
   check(
     'parseLine 认 apply 与阈值 + 预算',
     applyLine.kind === 'apply' && applyLine.pid === 17884 &&
-      applyLine.thresholds.A === 3 && applyLine.thresholds.B === 2 && applyLine.thresholds.C === 2 &&
+      applyLine.thresholds.A === 3 && applyLine.thresholds.B === 2 && applyLine.thresholds.C === 3 &&
       applyLine.budget === 3 && applyLine.window === 6,
     JSON.stringify({ ...applyLine.thresholds, budget: applyLine.budget, window: applyLine.window })
   )
@@ -115,7 +115,7 @@ function check(label, pass, detail) {
 // ── 4. 聚合：分布、会话去重、提示后首个动作、窗口内转向、测量
 {
   const text = [
-    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true',
+    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=3 budget=3 window=6 panel=true',
     '2026-11-07T02:01:00.000Z bundled skill registered: stuck-gate <- C:/a/SKILL.md',
     '2026-11-07T02:02:00.000Z inject session=s-1 turn=1 step=3 signals=A inj=i1 chars=305 tokens=200 files=1 worstEdits=3 worstStreak=3 worstErrors=0 searched=false measured=no',
     '2026-11-07T02:02:10.000Z outcome session=s-1 turn=1 inj=i1 after=A first=ops_bash class=verify steps=1 before=edit',
@@ -157,7 +157,7 @@ function check(label, pass, detail) {
   )
   check(
     '聚合：阈值与预算取最后一条 apply',
-    a.thresholds.A === 3 && a.thresholds.B === 2 && a.thresholds.C === 2 && a.budget === 3 && a.window === 6,
+    a.thresholds.A === 3 && a.thresholds.B === 2 && a.thresholds.C === 3 && a.budget === 3 && a.window === 6,
     JSON.stringify({ ...a.thresholds, budget: a.budget, window: a.window })
   )
   check(
@@ -200,7 +200,7 @@ function check(label, pass, detail) {
   )
 
   const applyAdv = parseLine(
-    '2026-11-24T15:27:38.307Z apply pid=20268 logFile=.tmp-samples.log A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1'
+    '2026-11-24T15:27:38.307Z apply pid=20268 logFile=.tmp-samples.log A=3 B=2 C=3 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1'
   )
   check(
     'parseLine 认 apply 的方案层阈值',
@@ -210,7 +210,7 @@ function check(label, pass, detail) {
   )
 
   const text = [
-    '2026-11-24T15:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1',
+    '2026-11-24T15:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=3 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1',
     '2026-11-24T15:01:00.000Z inject session=s-1 turn=1 step=5 signals=F inj=i1 chars=297 tokens=207 files=0 worstEdits=0 worstStreak=0 worstErrors=2 searched=false measured=no',
     '2026-11-24T15:02:00.000Z inject session=s-1 turn=1 step=8 signals=O inj=i2 chars=235 tokens=204 files=1 worstEdits=7 worstStreak=0 worstErrors=0 searched=false measured=yes:ops_bash:fail',
     '2026-11-24T15:03:00.000Z inject session=s-2 turn=1 step=4 signals=P inj=i3 chars=242 tokens=197 files=1 worstEdits=3 worstStreak=0 worstErrors=0 searched=false measured=yes:ops_bash:fail',
@@ -239,7 +239,7 @@ function check(label, pass, detail) {
 
   // 老日志（v0.2.x）没有 F=/O=/P=/M= 也没有 futile 行：阈值必须是空串 / 0，不能瞎补默认值。
   const legacy = aggregate(
-    parseLog('2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true'),
+    parseLog('2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=3 budget=3 window=6 panel=true'),
     { logFile: 'C:/x.log', exists: true, bytes: 80 }
   )
   check(
@@ -269,7 +269,7 @@ function check(label, pass, detail) {
 // 这时「转向 0 次」是「没测」，不是「测了没有」——rate 必须是 null 而不是 0。
 {
   const legacy = [
-    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2',
+    '2026-11-07T02:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=3',
     '2026-11-07T02:02:00.000Z inject session=s-1 turn=1 step=3 signals=C chars=254 files=1 worstEdits=1 worstStreak=1 worstErrors=0 searched=false',
     '2026-11-07T02:02:10.000Z outcome session=s-1 turn=1 after=C first=ops_bash class=verify steps=0',
     '2026-11-07T02:03:00.000Z inject session=s-1 turn=1 step=9 signals=C chars=254 files=2 worstEdits=1 worstStreak=1 worstErrors=0 searched=false',
@@ -445,7 +445,7 @@ function check(label, pass, detail) {
 // ── 9. done-state 的 suppress 行要能被面板读出来（醒着但故意不出声 ≠ 没挂上）
 {
   const text = [
-    '2026-11-11T00:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true',
+    '2026-11-11T00:00:00.000Z apply pid=1 logFile=C:/x.log A=3 B=2 C=3 budget=3 window=6 panel=true',
     '2026-11-11T00:00:01.000Z suppress session=s-1 turn=1 step=7 reason=done',
     '2026-11-11T00:00:02.000Z suppress session=s-2 turn=1 step=8 reason=done'
   ].join('\n')
@@ -495,7 +495,7 @@ function check(label, pass, detail) {
     '2026-11-07T05:00:36.666Z panel register failed: webserver: duplicate prefix route "/better-debug"',
     '2026-11-07T05:01:51.152Z panel register failed: webserver: duplicate prefix route "/better-debug"',
     '2026-11-14T00:44:41.005Z disabled by config, no gate installed',
-    '2026-11-14T11:23:07.155Z apply pid=5596 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true'
+    '2026-11-14T11:23:07.155Z apply pid=5596 logFile=C:/x.log A=3 B=2 C=3 budget=3 window=6 panel=true'
   ].join('\n')
   const a = aggregate(parseLog(text), { logFile: 'C:/x.log', exists: true, bytes: text.length })
   check(
@@ -511,7 +511,7 @@ function check(label, pass, detail) {
 // ── 11c. 世代之内仍有失败 → current 必须亮（否则就是「修好了」的假绿）
 {
   const text = [
-    '2026-11-14T11:23:07.155Z apply pid=5596 logFile=C:/x.log A=3 B=2 C=2 budget=3 window=6 panel=true',
+    '2026-11-14T11:23:07.155Z apply pid=5596 logFile=C:/x.log A=3 B=2 C=3 budget=3 window=6 panel=true',
     '2026-11-14T11:23:09.000Z panel register failed: duplicate prefix route "/better-debug"',
     '2026-11-14T11:23:10.000Z skill register failed: duplicate skill name'
   ].join('\n')
@@ -1029,7 +1029,7 @@ function check(label, pass, detail) {
   const logFile = join(base, 'nested', 'better-debug.log')
   const warns = []
   const ctx = { logger: { warn: (line) => warns.push(line) } }
-  const line = (index) => 'apply pid=1 logFile=x A=3 B=2 C=2 seq=' + index
+  const line = (index) => 'apply pid=1 logFile=x A=3 B=2 C=3 seq=' + index
   const readAll = (path) => readFileSync(path, 'utf8').split('\n').filter((row) => row.length > 0)
 
   // 15a logFile 为空串 = 显式关闭：不建目录、不写、不 warn。
