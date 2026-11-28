@@ -42,10 +42,13 @@ jobs:
         # 而这段要的是 glob 展开 `*.tgz`，写两套等于让一半矩阵测不到。
         shell: bash
         run: |
-          npm pack --pack-destination "$RUNNER_TEMP"
-          mkdir -p "$RUNNER_TEMP/unpacked"
-          tar -xzf "$RUNNER_TEMP"/*.tgz -C "$RUNNER_TEMP/unpacked"
-          cd "$RUNNER_TEMP/unpacked/package"
+          # 全部用相对路径：Windows runner 的 $RUNNER_TEMP 是 `D:\a\_temp`，
+          # 带盘符冒号的绝对路径会被 GNU tar 当成「远程主机 D:」而报
+          # `tar (child): Cannot connect to D: resolve failed`。
+          mkdir -p ./.pack
+          npm pack --pack-destination ./.pack
+          tar -xzf ./.pack/*.tgz -C ./.pack
+          cd ./.pack/package
           node test/sim.mjs
           node test/panel.mjs
           node test/client.mjs
@@ -86,15 +89,32 @@ jobs:
       - name: pack and self-test the tarball
         shell: bash
         run: |
-          npm pack --pack-destination "$RUNNER_TEMP"
-          mkdir -p "$RUNNER_TEMP/unpacked"
-          tar -xzf "$RUNNER_TEMP"/*.tgz -C "$RUNNER_TEMP/unpacked"
-          cd "$RUNNER_TEMP/unpacked/package"
+          # 全部用相对路径：Windows runner 的 $RUNNER_TEMP 是 `D:\a\_temp`，
+          # 带盘符冒号的绝对路径会被 GNU tar 当成「远程主机 D:」而报
+          # `tar (child): Cannot connect to D: resolve failed`。
+          mkdir -p ./.pack
+          npm pack --pack-destination ./.pack
+          tar -xzf ./.pack/*.tgz -C ./.pack
+          cd ./.pack/package
           node test/sim.mjs
           node test/panel.mjs
           node test/client.mjs
           node --check lib/index.js
+      # 幂等：本机已经发过、或者重跑同一个 tag 时不要红在 EPUBLISHCONFLICT 上。
+      # 这一条也让「为了修 CI 而移动 tag」是安全的。
+      - name: 这个版本是否已经在 npm 上
+        id: published
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "dsh-better-debug@$version" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::dsh-better-debug@$version 已在 npm 上，跳过 publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: publish
+        if: steps.published.outputs.exists != 'true'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
