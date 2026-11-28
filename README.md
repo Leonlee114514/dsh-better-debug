@@ -69,7 +69,7 @@ inject session=… turn=1 step=19 signals=O inj=e7db4417 chars=235 tokens=204 fi
 | 战术 | **A** 连续盲改 | 同一绝对路径的 `fs/write-intent` 计数，测量返回后按目录清零 | 连续 3 次 |
 | 战术 | **B** 重复报错 | 同一 `工具\|目标\|错误指纹` 的 episode 计数，含 `isError:false` 的测量失败；搜索按当时计数记基线 | 第 2 次 |
 | 战术 | **C** 改后未验证又写入 | 自上次测量以来的盲改次数（跨文件、与步号无关），够 N 处则上膛，**再写一处**才触发 | 3 处 |
-| 方案 | **F** 错误族 | 同一 `工具\|目标` 上不同指纹的数量与总次数；换出新错之后搜索过才免疫 | 3 种指纹且共 4 次 |
+| 方案 | **F** 错误族 · *实验性* | 同一 `工具\|目标` 上不同指纹的数量与总次数；换出新错之后搜索过才免疫 | 3 种指纹且共 4 次 |
 | 方案 | **O** 验证振荡 · *实验性* | 同一回路中**绿过的失败条目复发**，且两次结果之间有写入 | 第 3 次翻转 |
 | 方案 | **P** 补丁链 · *实验性* | 连续「测量失败 → 写入 → 仍失败」且**失败面没有收缩** | 连续 3 轮 |
 | 元 | **M** 干预失效 | 注入后窗口内无测量 / 搜索，pending 作废计 `futile` | 连续 2 次无效注入 |
@@ -85,6 +85,7 @@ inject session=… turn=1 step=19 signals=O inj=e7db4417 chars=235 tokens=204 fi
 | --- | --- | --- |
 | 硬测量 | `verify` `run_tests` `run_test`（装了 `dsh-lsp-actions` 时含 `lsp_diagnostics`） | 恒为测量 |
 | 软测量 | `ops_bash` `bash` `shell` `pwsh` | 命令命中 `measureCommands`，或描述命中 `measureIntent` 且命令不是 `ls/dir/cat/type/head/tail` |
+| PTC 根调用 | `run_code` | `code` 里出现 `measureCommands` 白名单命令才算测量；不看 `measureIntent`（裸 `test` 对整段代码测等于「注释里提到测试就算测过了」）。子调用逐个按自己的工具名判 |
 | 搜索 | `web_search` `research` `advanced_search` `multi_search` `platform_search` `domain_search` `cache_search` `video_search` | 视为取得外部先验 |
 | 方法论 | `skill` | 计为有效转向 |
 | 编辑 | `edit` `write` `ops_write` `str_replace` `apply_patch` `notebook_edit` | 计入写入序号 |
@@ -97,13 +98,18 @@ inject session=… turn=1 step=19 signals=O inj=e7db4417 chars=235 tokens=204 fi
 `ruff check`、`mypy`、`git diff --stat`，可用 `measureCommands` 覆盖。生成物与锁文件由
 `excludePaths` 排除。
 
+`measureIntent` 只对**软测量工具的描述**生效（模型自称在验证），不参与 `run_code` 的判定：
+那个正则含裸 `test` / `measure` / `diagnos`，拿去测整段脚本文本会把「注释里写了测试」也算成
+跑过测试，等于把 C 的盲改计数洗白。在 `run_code` 里演算、写断言而不调工具的测量，插件看不见 ——
+这是刻意的取舍，宁可漏认，也不误清。
+
 ### 两套「身份」
 
 同一段报错要回答两个不同的问题，因此有两套归一化：
 
 | 用途 | 归一化 | 回答的问题 |
 | --- | --- | --- |
-| 指纹（B / F） | 首 6 行、前 300 字符，归一化十六进制数、路径与数字后取 sha256 前 16 位 | 同一个操作是不是在用同一句话反复报错 |
+| 指纹（B / F） | 首 6 行、前 300 字符，归一化十六进制串与路径后取 sha256 前 16 位（数字原样保留） | 同一个操作是不是在用同一句话反复报错 |
 | 失败条目（P / O） | 只切掉「路径 + 紧跟其后的行列号」，消息里的数字原样保留 | 失败面是不是换成了别的问题 |
 
 两套必须分开：把 `case-1` / `case-2` 归一，P 会把两个不同断言算成同一个错误；行号不剥，P / O 又会
@@ -112,18 +118,26 @@ inject session=… turn=1 step=19 signals=O inj=e7db4417 chars=235 tokens=204 fi
 B 的 key 是 `工具|目标|指纹`，F 的 key 是 `工具|目标` —— F 统计的正是指纹的**多样性**。若 F 也带
 指纹，每种新报错都会各自开 episode，它就退化成更迟钝的 B。
 
-### O 与 P 是实验性信号
+### F / O / P 是实验性信号
 
-A / B / C / F / M 都在真实会话里被验证过会命中；**O（验证振荡）与 P（补丁链）标为实验性**：在本机
-1113 行真实日志里两者各触发 **0** 次（同期 A 17、B 36、C 159、F 1、M 8）。它们的判据依赖「失败
-集合」的形状，在真实工程里最容易被两种健康行为骗到：按红绿红绿的正常 TDD 节奏被读成振荡，逐个
-修互相独立的文件被读成补丁链。
+A / B / C / M 都在真实会话里被反复验证过会命中；**F（错误族）、O（验证振荡）、P（补丁链）标为
+实验性**，各自的原因不同：
 
-- 默认阈值保留（`oscillationThreshold: 3` / `patchChainThreshold: 3`），不默认关闭 —— 关掉等于让
-  这两条判据永远拿不到真实样本，永远无法证伪。
+- **O / P**：在本机早期 1113 行真实日志里两者各触发 **0** 次（同期 A 17、B 36、C 159、F 1、M 8）。
+  它们的判据依赖「失败集合」的形状，在真实工程里最容易被两种健康行为骗到：按红绿红绿的正常 TDD
+  节奏被读成振荡，逐个修互相独立的文件被读成补丁链。
+- **F**：收紧正则后仍几乎不触发（0.3.0 之后 2.8 天只有 1 次），且那一次是跨错误计数凑出来的 ——
+  根因是 `errorTargetOf` 对 `old_string was not found`、`npm ERR! code ELIFECYCLE` 这类文本抽不出
+  目标，族根本建不起来。这一面实际一直由 B 代为覆盖（B 的 key 多一位指纹）。
+
+默认阈值保留（`oscillationThreshold: 3` / `patchChainThreshold: 3` / `repeatFamilyThreshold: 4`），
+不默认关闭 —— 关掉等于让这几条判据永远拿不到真实样本，永远无法证伪。
+
 - 但把它们当实验性看待：命中时按「值得看一眼」处理，而不是「照做」。A / B / C 的提醒通常是「这一步
-  确实在重复」；O / P 的提醒可能是「你的节奏恰好长得像」。
-- 想彻底关掉：`oscillationThreshold: 10` + `patchChainThreshold: 10`（两者上限都是 10）。
+  确实在重复」；O / P 的提醒可能是「你的节奏恰好长得像」，F 的提醒可能只是两条无关报错被归到了
+  同一个空目标上。
+- 想彻底关掉：`oscillationThreshold: 10` + `patchChainThreshold: 10`（两者上限都是 10）、
+  `repeatFamilyThreshold: 20`（上限 20）。
 
 ### M：元闸门
 
@@ -143,7 +157,8 @@ M 与其余六条在机制上不同：
 同一 step 内不叠加陈述同一件事：
 
 - **P 与 F** 同时命中只发 P（补丁链比错误族更接近方案层），F 记为已发；
-- **F / P 命中时压掉 B**（「这个错重复了」是弱化版观察），B 记为已发；
+- **F / P 命中时压掉 B**（「这个错重复了」是弱化版观察），B 记为已发；P **没到**
+  `patchChainThreshold` 时不算命中，B 照常开口，不让补丁链在攒够证据前先把话说死；
 - **A / B 命中时** C 记为已发，不再补一句「改完没验证」；
 - **M** 始终单独成条。
 
@@ -154,9 +169,9 @@ M 与其余六条在机制上不同：
 
 | 信号 | 重新武装条件 |
 | --- | --- |
-| A | 一次测量结果返回（仅清相关目录） |
+| A | 一次测量**清掉了相关目录里的盲改**（或测量本身不带目录）才重新武装；在管不到的目录跑测量不算新事实 |
 | B | 该 episode 之后发生搜索（之后重新攒够阈值才再报，不是终生免责） |
-| C | 一次测量结果返回即解除上膛并清零盲改计数（不论成败）；但只有**成功**的测量才重新武装，失败的测量没带来新事实，现场还在 |
+| C | 一次测量结果返回即解除上膛并清零盲改计数（不论成败）；但只有**成功**的测量才重新武装，失败的测量没带来新事实，现场还在。解除不要求「这次测量清掉了具体文件」：`run_code` 里的写入看不出路径，任何测量都是当时唯一可得的事实，所以带目录的测量同样解除；只有「这个目录里的写入」被清掉才算数的是 A |
 | F | 搜索（仅对搜索前出现的指纹免疫），或一次成功测量 |
 | O | 同一回路连续两次成功（只重新武装这条回路） |
 | P | 一次成功测量，或失败面开始收缩，或一字未变 |
@@ -172,14 +187,15 @@ M 与其余六条在机制上不同：
    的消息会被匹配，插件自身注入不计。
 
    ```js
-   /别搜|不要搜|不用搜|先别搜|直接改|快速试|别折腾|先试试|
+   /别搜|不要搜|不用搜(?!索)|先别搜|直接改(?!过)|别折腾了|先试试(?:直接改|改)|
     don'?t\s+(?:search|bother\s+searching)|no\s+need\s+to\s+search|
     skip\s+(?:the\s+)?search(?:ing)?|stop\s+searching|
-    just\s+(?:do\s+it|edit|fix\s+it|make\s+the\s+change|change\s+it)|quick\s+try/i
+    just\s+(?:do\s+it|edit|fix\s+it|make\s+the\s+change|change\s+it)/i
    ```
 
-   中英双语。每条都要求祈使语气：「我先搜一下再改」这类描述性用法**不会**静音 —— 误静音会让整个
-   turn 失去保护，比漏静音一次更贵。
+   中英双语。每条都要求落在祈使位置：「我先搜一下再改」「我快速试一下这个假设」「不用搜索我也知道
+   根因」「这个文件我直接改过了」这类描述性用法**不会**静音 —— 误静音会让整个 turn 失去保护，比
+   漏静音一次更贵。`test/sim.mjs` 组 71 用 7 条祈使 + 9 条描述性句子把这条边界钉住。
 3. **子会话不生效**：`origin === 'subagent'` 或 `delegationDepth > 0` 一律跳过。
 4. **不使用 `reject`**：拦截只表现为追加一条用户消息，不会把 turn 变成 no-op。
 
@@ -213,6 +229,9 @@ M 的完整模板：
 - P 的「失败面」按失败条目集合数出来，收缩要求当前集合是上一轮的真子集。换到**别的文件**一律算
   进展（分头修不同文件不该被说成打转），代价是「在 A 里改、把错推到 B」这种真补丁链也说不出话；
 - F 需要能抽出路径。抽不出目标（纯文本报错、只有 `[exit code: 1]`）时只留 B 的记账，不进错误族；
+- M 的判据是「连续 2 次注入无转向」，统计基线在小样本下不稳：本机全量 92 个注入 turn 的 futile 率
+  是 53.7%，但只看「futile 已达 2 次」的 10 个 turn 只有 30% —— 前者被大量首次注入稀释。看面板时
+  别把全局 futile 率当 M 的命中率；
 - 重复 episode 只在**连续失败**时累加：`失败 → 绿 → 同一个失败` 是振荡（O 管），不该被说成「同一个
   错重复 N 次」。
 
@@ -233,7 +252,7 @@ M 的完整模板：
 dsh plugin --profile web add dsh-better-debug
 
 # 指定版本
-dsh plugin --profile web add dsh-better-debug@0.3.5
+dsh plugin --profile web add dsh-better-debug@0.3.6
 ```
 
 本地 tarball（内容与 npm 包同源，由 `files` 白名单决定；相对路径按**当前工作目录**解析）：
@@ -241,7 +260,7 @@ dsh plugin --profile web add dsh-better-debug@0.3.5
 ```bash
 # 在仓库根执行，产物落在 ./dsh-better-debug-<version>.tgz
 npm pack
-dsh plugin --profile web add ./dsh-better-debug-0.3.5.tgz
+dsh plugin --profile web add ./dsh-better-debug-*.tgz
 ```
 
 装完由 `dsh-plugin-manager` 自动把包名追加进该 profile 的 `dsh.profile.bundles`，不需要手改；
@@ -311,7 +330,7 @@ profile 的 patch 里。
     patchChainThreshold: 3        # P：连续几轮失败—写入（2–10）· 实验性
     metaAfterFutile: 2            # M：连续几次无效注入（1–5）
     metaGate: true                # M 总开关
-    decayEditsOnVerify: true      # 测量后清零盲改计数（C:/、/c/、/mnt/c/ 三种写法视为同一目录）
+    decayEditsOnVerify: true      # 测量后解除 C 的上膛并清零盲改计数（C:/、/c/、/mnt/c/ 视为同一目录）
     doneOnPresent: true           # present 成功后休眠
     measureCommands: ""           # 覆盖测量命令正则；空 = 内置清单
     measureIntent: ""             # 覆盖测量意图正则
@@ -344,7 +363,7 @@ profile 的 patch 里。
 加载成功必有一行：
 
 ```
-apply pid=… logFile=… A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1 logMax=2097152 logKeep=2
+apply pid=… logFile=… A=3 B=2 C=3 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1 logMax=2097152 logKeep=2
 ```
 
 **没有 `apply` 行即未挂载。** 其余行型：
@@ -392,7 +411,7 @@ suppress session=… reason=done
 ## 本地验证
 
 ```bash
-node test/sim.mjs           # 298 个用例：闸门语义、四套 runner 语料、可移植性
+node test/sim.mjs           # 345 个用例：闸门语义、四套 runner 语料、可移植性
 node test/panel.mjs         # 100 个用例：日志解析、聚合、世代判定、埋点、准入闸
 node test/client.mjs        # 16 个用例：客户端 facade 契约（inject 声明、座位注册）
 node scripts/judge-health.mjs test/fixtures/better-debug.sample.log   # 判据体检（样本日志应全 PASS）
@@ -400,7 +419,7 @@ npm run test:posix          # 以 POSIX 路径语义重跑 sim + panel
 npm run test:linux          # 以 Linux 平台语义（区分大小写）重跑
 npm run test:slow           # 落盘延迟 400ms，验证「等条件」而非「等时长」（101 条）
 npm run verify              # 全部（含语法检查、死代码、发布契约）
-npm run judge-health        # 拿真实日志算四个数，任一越界 exit 1
+npm run judge-health        # 拿真实日志算四个数：0 健康 / 1 越界或无数据 / 2 读不到日志
 ```
 
 `npm run judge-health` 是给自己用的：它把「C 是不是又在替别的信号开口」变成四个可断言的数
@@ -408,6 +427,11 @@ npm run judge-health        # 拿真实日志算四个数，任一越界 exit 1
 同 session 的下一条 `measure` 配对，问那次测量到底有没有把写入清掉；没有后续测量的 `arm` 不进分母。
 默认读 `$DSH_HOME/logs/better-debug.log`，换机器或换模型后先跑一遍看基线，再决定阈值要不要动。
 加 `--since-apply` 只判当前这份代码写出来的行 —— 旧行是旧判据轴产生的，会把每个比例都带偏。
+
+退出码三态：`0` 至少一个判据真的判过且没有越界；`1` 有判据越界，**或者四个判据全部因样本不足跳过**；
+`2` 日志读不到（路径写错、文件还没生成）。全 SKIP 与「四个数都在阈值内」不该给同一个码 ——
+`test:unit` 用 `&&` 串着它，全 SKIP 也 exit 0 等于把「没测」记成「测过了」。
+只有部分判据跳过、其余判过的仍在阈值内的，仍然 exit 0。
 
 `test/client.mjs` 把浏览器侧那条最难复现的约束钉在仓库里：客户端插件拿到的是
 `dsh-cordis-client-runner` 造的 dynamic facade，不是 cordis Context。测试用一个会抛错的
@@ -458,6 +482,19 @@ Flavell（*American Psychologist* 34, 1979）把认知监控定义为对自身�
 ### 这些文献在代码里的位置
 
 文献提供的是失效模式的分类，不是阈值的推导。21 个配置键里的每一个数值都来自事件流的可观测统计，没有一个是「按文献算出来的」。文献只回答一个问题：为什么要看这几件事。
+
+## 已知问题
+
+[KNOWN-ISSUES.md](./KNOWN-ISSUES.md) 是**未解决问题**的留档：面板的六条 P2、脚本与工程的三条、
+结构性判据缺陷（O / P / F 为什么几乎不触发）、信号价值的实测结论，以及明确决定不修的五条。
+
+三份文档的分工：「适用范围与边界」（本节上面）写的是**设计上接受的边界**，KNOWN-ISSUES 写的是
+**实现上尚未修掉的问题**，CHANGELOG 写的是**已经修掉的问题**。
+
+## 变更记录
+
+[CHANGELOG.md](./CHANGELOG.md) 按版本记录行为变化与根因（0.3.6 起开始维护，更早的版本由 git 历史回补）。
+0.x 阶段的次版本号可能包含行为改变，升级前请看一眼对应小节。
 
 ## License
 

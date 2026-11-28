@@ -78,7 +78,7 @@ Seven signals in three layers: the tactical layer detects **repeated actions**, 
 | Tactical | **A** blind edits | `fs/write-intent` count per absolute path; cleared per directory when a measurement returns | 3 in a row |
 | Tactical | **B** repeated error | episode count per `tool\|target\|fingerprint`, including `isError:false` measurement failures; a search records the current count as a baseline | 2nd time |
 | Tactical | **C** edit-then-write without verifying | blind writes since the last measurement (cross-file, step numbers irrelevant); arms at N, fires on the **next write** | 3 writes |
-| Strategy | **F** error family | distinct fingerprints and total count per `tool\|target`; a search immunises the fingerprints seen before it | 3 fingerprints and 4 hits |
+| Strategy | **F** error family · *experimental* | distinct fingerprints and total count per `tool\|target`; a search immunises the fingerprints seen before it | 3 fingerprints and 4 hits |
 | Strategy | **O** verification oscillation · *experimental* | a **previously-green failing item recurs** in the same loop, with an edit between the two results | 3rd flip |
 | Strategy | **P** patch chain · *experimental* | consecutive "measurement fails → edit → still fails" with **no shrinkage of the failure surface** | 3 rounds |
 | Meta | **M** intervention failure | no measurement or search inside the window after an injection; the pending entry is voided and counted as `futile` | 2 futile injections |
@@ -95,6 +95,7 @@ unrelated directory does not clear the blind-edit count of the target file.
 | --- | --- | --- |
 | Hard measurement | `verify` `run_tests` `run_test` (plus `lsp_diagnostics` when `dsh-lsp-actions` is installed) | always a measurement |
 | Soft measurement | `ops_bash` `bash` `shell` `pwsh` | the command matches `measureCommands`, or the description matches `measureIntent` and the command is not `ls/dir/cat/type/head/tail` |
+| PTC root call | `run_code` | a measurement only when `code` contains a `measureCommands` whitelist command; `measureIntent` is deliberately **not** consulted (a bare `test` matched against the whole script would count a comment mentioning tests as a test run). Each `tools.xxx()` sub-call is judged by its own tool name |
 | Search | `web_search` `research` `advanced_search` `multi_search` `platform_search` `domain_search` `cache_search` `video_search` | treated as an external prior |
 | Methodology | `skill` | counted as a valid turn |
 | Edit | `edit` `write` `ops_write` `str_replace` `apply_patch` `notebook_edit` | advances the write sequence |
@@ -107,13 +108,19 @@ Built-in measurement commands cover `test|verify|check|lint|typecheck|build` for
 `eslint`, `ruff check`, `mypy` and `git diff --stat`; override them with `measureCommands`. Generated
 artifacts and lockfiles are excluded via `excludePaths`.
 
+`measureIntent` applies only to a **soft-measurement tool's description** (the model claiming it is
+verifying); it never decides `run_code`. That regex contains bare `test` / `measure` / `diagnos`, so
+matching it against a whole script would treat a comment mentioning tests as a test run — which would
+launder C's blind-edit count. Measurements computed inside `run_code` without calling a tool are
+invisible to the plugin; that is the deliberate trade-off: under-count rather than clear wrongly.
+
 ### Two kinds of "identity"
 
 The same error text has to answer two different questions, so there are two normalisations:
 
 | Purpose | Normalisation | Question answered |
 | --- | --- | --- |
-| Fingerprint (B / F) | first 6 lines, first 300 chars; hex, paths and numbers normalised; first 16 hex chars of a sha256 | is this operation failing with the same sentence again |
+| Fingerprint (B / F) | first 6 lines, first 300 chars; hex strings and paths normalised, digits kept as-is; first 16 hex chars of a sha256 | is this operation failing with the same sentence again |
 | Failing item (P / O) | only "path + the line/column immediately after it" is stripped; digits in the message stay | has the failure surface moved to a different problem |
 
 They must stay separate: normalise `case-1` / `case-2` and P counts two different assertions as one error; keep line
@@ -122,19 +129,29 @@ numbers and P / O treat one edit of one place as a new problem.
 B is keyed by `tool|target|fingerprint`, F by `tool|target` — F measures the **diversity** of fingerprints. If F
 also carried the fingerprint, every new error would open its own episode and F would degrade into a duller B.
 
-### O and P are experimental
+### F / O / P are experimental
 
-A / B / C / F / M have all been observed firing in real sessions; **O (oscillation) and P (patch chain) are
-marked experimental**: across 1113 real log lines on the author's machine each fired **0** times (A 17,
-B 36, C 159, F 1, M 8 over the same period). Their verdicts depend on the shape of the failure *set*, and
-in real engineering work two healthy behaviours imitate that shape: an ordinary red-green-red TDD rhythm
-reads as oscillation, and fixing independent files one by one reads as a patch chain.
+A / B / C / M have all been observed firing repeatedly in real sessions; **F (error family), O (oscillation)
+and P (patch chain) are marked experimental**, each for a different reason:
 
-- Default thresholds stay (`oscillationThreshold: 3` / `patchChainThreshold: 3`) rather than defaulting to off —
-  turning them off means those two verdicts can never collect real samples and can never be falsified.
+- **O / P**: across 1113 early real log lines on the author's machine each fired **0** times (A 17, B 36,
+  C 159, F 1, M 8 over the same period). Their verdicts depend on the shape of the failure *set*, and in
+  real engineering work two healthy behaviours imitate that shape: an ordinary red-green-red TDD rhythm
+  reads as oscillation, and fixing independent files one by one reads as a patch chain.
+- **F**: even after tightening the regex it almost never fires (once in 2.8 days since 0.3.0), and that one
+  hit was assembled across unrelated errors. The root cause is that `errorTargetOf` cannot extract a target
+  from text like `old_string was not found` or `npm ERR! code ELIFECYCLE`, so the family never forms. That
+  surface has in practice always been covered by B instead (B keys on one extra field, the fingerprint).
+
+Default thresholds stay (`oscillationThreshold: 3` / `patchChainThreshold: 3` / `repeatFamilyThreshold: 4`)
+rather than defaulting to off — turning them off means those verdicts can never collect real samples and
+can never be falsified.
+
 - Treat them as experimental: when one fires, take it as "worth a look", not "do this". A / B / C usually
-  mean "this step really is a repeat"; O / P may mean "your rhythm merely looks like one".
-- To switch them off completely: `oscillationThreshold: 10` + `patchChainThreshold: 10` (10 is the ceiling for both).
+  mean "this step really is a repeat"; O / P may mean "your rhythm merely looks like one", and F may mean
+  nothing more than two unrelated errors landing on the same empty target.
+- To switch them off completely: `oscillationThreshold: 10` + `patchChainThreshold: 10` (10 is the ceiling
+  for both) and `repeatFamilyThreshold: 20` (ceiling 20).
 
 ### M: the meta gate
 
@@ -159,6 +176,8 @@ One step never stacks two statements of the same thing:
 - **P and F** firing together emits only P (a patch chain is closer to the strategy layer) and marks F as
   fired;
 - **F / P firing suppresses B** ("this error repeated" is the weaker observation) and marks B as fired;
+  a patch chain **below** `patchChainThreshold` has not fired, so B still speaks instead of being muted
+  while the chain is still accumulating evidence;
 - **when A / B fire**, C is marked as fired instead of adding "you edited without verifying";
 - **M** is always its own message.
 
@@ -170,9 +189,9 @@ situation changed":
 
 | Signal | Re-arms when |
 | --- | --- |
-| A | a measurement returns (clears the relevant directories only) |
+| A | a measurement that actually **cleared blind writes under the relevant directories** (or a measurement that carries no directory at all); running one in a directory it cannot reach is not a new fact |
 | B | a search happens after that episode (it must re-accumulate to the threshold — not a lifetime immunity) |
-| C | a measurement returns (pass or fail — disarms and zeroes the blind-write count); only a **successful** one re-arms, because a failing measurement brings no new fact and the situation is unchanged |
+| C | a measurement returns (pass or fail — disarms and zeroes the blind-write count); only a **successful** one re-arms, because a failing measurement brings no new fact and the situation is unchanged. Disarming does not require the measurement to clear specific files: writes inside `run_code` carry no path, so any measurement is the only fact available at that moment, and a measurement scoped to a directory disarms too. Path-scoped clearing is what A depends on |
 | F | a search (immunises only fingerprints seen before it), or one successful measurement |
 | O | two consecutive successes on the same loop (re-arms that loop only) |
 | P | one successful measurement, or the failure surface starts shrinking, or nothing changed at all |
@@ -189,15 +208,17 @@ Ordinary signals share the per-turn budget `maxInjectsPerTurn` (default 3).
    muted. Only messages with `source.kind === 'user'` are matched; the plugin's own injections are not.
 
    ```js
-   /别搜|不要搜|不用搜|先别搜|直接改|快速试|别折腾|先试试|
+   /别搜|不要搜|不用搜(?!索)|先别搜|直接改(?!过)|别折腾了|先试试(?:直接改|改)|
     don'?t\s+(?:search|bother\s+searching)|no\s+need\s+to\s+search|
     skip\s+(?:the\s+)?search(?:ing)?|stop\s+searching|
-    just\s+(?:do\s+it|edit|fix\s+it|make\s+the\s+change|change\s+it)|quick\s+try/i
+    just\s+(?:do\s+it|edit|fix\s+it|make\s+the\s+change|change\s+it)/i
    ```
 
-   Bilingual (Chinese and English). Every alternative requires the imperative mood: descriptive uses such
-   as "let me search first, then edit" do **not** mute — muting by mistake costs the whole turn its
-   protection, which is more expensive than missing one.
+   Bilingual (Chinese and English). Every alternative must sit in an imperative position: descriptive uses
+   such as "let me try reproducing this first", "I already edited that file" or "I do not need to search to
+   know the cause" do **not** mute — muting by mistake costs the whole turn its protection, which is more
+   expensive than missing one. Group 71 in `test/sim.mjs` pins that boundary with 7 imperatives and 9
+   descriptive sentences.
 3. **Sub-sessions are skipped**: `origin === 'subagent'` or `delegationDepth > 0` always bypasses the gate.
 4. **Never `reject`**: interception is only an appended user message, so the turn never becomes a no-op.
 
@@ -240,6 +261,10 @@ O / P thresholds is equivalent to disabling them).
   into B" chain;
 - F needs an extractable path. With no target (plain-text errors, nothing but `[exit code: 1]`) only B keeps
   the record and the error family does not form;
+- M triggers on "2 consecutive injections with no change of direction", and that baseline is unstable on small
+  samples: across all 92 injected turns on the author's machine the futile rate is 53.7%, but restricted to the
+  10 turns that already reached `futile >= 2` it is 30% — the former is diluted by first injections. Do not
+  read the global futile rate as M's hit rate;
 - a repeated episode accumulates only across **consecutive** failures: `fail → green → same fail` is oscillation
   (O's job) and should not be described as "the same error repeated N times".
 
@@ -262,7 +287,7 @@ app: Settings → Built-in plugins → Discover, search for `dsh-better-debug`, 
 dsh plugin --profile web add dsh-better-debug
 
 # pin a version
-dsh plugin --profile web add dsh-better-debug@0.3.5
+dsh plugin --profile web add dsh-better-debug@0.3.6
 ```
 
 Local tarball (same content as the npm package, decided by the `files` allowlist; a relative path is
@@ -271,7 +296,7 @@ resolved against the **current working directory**):
 ```bash
 # run from the repository root; the artifact lands at ./dsh-better-debug-<version>.tgz
 npm pack
-dsh plugin --profile web add ./dsh-better-debug-0.3.5.tgz
+dsh plugin --profile web add ./dsh-better-debug-*.tgz
 ```
 
 `dsh-plugin-manager` appends the package name to that profile's `dsh.profile.bundles` on its own — no
@@ -344,7 +369,7 @@ Add a `config:` block for the same id in your profile's `cordis.patch.yml`:
     patchChainThreshold: 3        # P: consecutive fail-then-write rounds (2–10) · experimental
     metaAfterFutile: 2            # M: consecutive futile injections (1–5)
     metaGate: true                # master switch for M
-    decayEditsOnVerify: true      # clear blind-edit counts on a measurement (C:/, /c/, /mnt/c/ count as one dir)
+    decayEditsOnVerify: true      # disarm C and clear blind-write counts on a measurement (C:/, /c/, /mnt/c/ count as one dir)
     doneOnPresent: true           # sleep after a successful present
     measureCommands: ""           # override the measurement-command regex; empty = built-in list
     measureIntent: ""             # override the measurement-intent regex
@@ -378,7 +403,7 @@ The log is the only acceptance surface: `ctx.logger` goes to the host process st
 afterwards, so every key event has a persisted line type. A successful load always writes:
 
 ```
-apply pid=… logFile=… A=3 B=2 C=2 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1 logMax=2097152 logKeep=2
+apply pid=… logFile=… A=3 B=2 C=3 budget=3 window=6 panel=true F=4/3 O=3 P=3 M=2/1 logMax=2097152 logKeep=2
 ```
 
 **No `apply` line means the plugin is not mounted.** The other line types:
@@ -434,7 +459,7 @@ logged; the gate is unaffected.
 ## Local verification
 
 ```bash
-node test/sim.mjs           # 298 cases: gate semantics, four runner corpora, portability
+node test/sim.mjs           # 345 cases: gate semantics, four runner corpora, portability
 node test/panel.mjs         # 100 cases: log parsing, aggregation, generations, instrumentation, admission fence
 node test/client.mjs        # 16 cases: client facade contract (inject declaration, slot registration)
 node scripts/judge-health.mjs test/fixtures/better-debug.sample.log   # criterion health check (sample log should pass)
@@ -442,7 +467,7 @@ npm run test:posix          # re-runs sim + panel with POSIX path semantics
 npm run test:linux          # re-runs with Linux platform semantics (case-sensitive)
 npm run test:slow           # 400 ms write latency, proving "wait for a condition" not "wait a duration" (101 cases)
 npm run verify              # everything (plus syntax check, dead code, publish contract)
-npm run judge-health        # four numbers from a real log, exit 1 if any is out of range
+npm run judge-health        # four numbers from a real log: 0 healthy / 1 out of range or no data / 2 unreadable log
 ```
 
 `npm run judge-health` is for self-inspection: it turns "is signal C opening its mouth on behalf of the other
@@ -452,6 +477,12 @@ that measurement actually cleared the writes; an `arm` with no following `measur
 It reads `$DSH_HOME/logs/better-debug.log` by default; run it once after changing machine or model to see the
 baseline before touching any threshold. Add `--since-apply` to judge only the lines written by the code that is
 currently loaded — older lines were produced by earlier criteria axes and will skew every ratio.
+
+The exit code has three states: `0` at least one criterion actually judged and nothing is out of range; `1` a
+criterion is out of range **or all four skipped for lack of samples**; `2` the log cannot be read (bad path, not
+created yet). An empty log and four numbers inside their limits must not share one code — `test:unit` chains it
+with `&&`, so exiting 0 on an all-SKIP run would record "never measured" as "measured and healthy". A partial
+skip, with the remaining criteria measured and inside range, still exits 0.
 
 `test/client.mjs` pins down the browser-side constraint that is hardest to reproduce: a client plugin receives
 the dynamic facade built by `dsh-cordis-client-runner`, not a cordis Context. The test replays that get trap with an
@@ -506,6 +537,20 @@ Flavell (*American Psychologist* 34, 1979) defines cognitive monitoring as aware
 ### Where this literature actually sits in the code
 
 The literature supplies the taxonomy of failure modes, not the thresholds. Every number among the 21 config keys comes from observable statistics over the event stream; none is derived from a paper. The literature answers one question only: why these things are worth watching.
+
+## Known issues
+
+[KNOWN-ISSUES.md](./KNOWN-ISSUES.md) (Chinese) is the archive of **unresolved** problems: six panel P2s,
+three script/engineering ones, the structural verdict defects (why O / P / F almost never fire), the
+measured signal-value findings, and the five items explicitly decided against.
+
+Division of labour between the three documents: "Scope and known limits" above records the boundaries
+**accepted by design**, KNOWN-ISSUES records **problems not yet fixed**, and CHANGELOG records problems
+**already fixed**.
+
+## Changelog
+
+[CHANGELOG.md](./CHANGELOG.md) records behavioural changes and their root causes per version (maintained from 0.3.6 onward; earlier versions are reconstructed from git history). Minor versions in the 0.x line can change behaviour — read the matching section before upgrading.
 
 ## License
 

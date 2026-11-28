@@ -447,7 +447,7 @@
       bar('A 同一文件连续盲改', bs.A || 0, total, 'a') +
       bar('B 同一操作重复报错', bs.B || 0, total, 'b') +
       bar('C 改完没有回路又动手', bs.C || 0, total, 'c') +
-      bar('F 同一目标上错误在变种', bs.F || 0, total, 'f') +
+      bar('F 同一目标上错误在变种 · 实验性', bs.F || 0, total, 'f') +
       bar('O 同一组验证来回翻转 · 实验性', bs.O || 0, total, 'e') +
       bar('P 补丁链：每轮修出下一个失败 · 实验性', bs.P || 0, total, 'd') +
       bar('M 元闸门：提醒过仍无转向', bs.M || 0, total, 'g')
@@ -455,7 +455,7 @@
     var adv = d.advanced || {}
     var fut = d.futile || {}
     $('advanced-bars').innerHTML =
-      bar('F 阈值（族次数/指纹数）', 0, 1, 'f').replace('<span class="num">0</span>',
+      bar('F 阈值（族次数/指纹数）· 实验性', 0, 1, 'f').replace('<span class="num">0</span>',
         '<span class="num">' + esc(adv.family || '—') + '</span>') +
       bar('O 阈值（翻转次数）· 实验性', 0, 1, 'e').replace('<span class="num">0</span>',
         '<span class="num">' + esc(String(adv.oscillation || 0)) + '</span>') +
